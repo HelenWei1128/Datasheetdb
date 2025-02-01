@@ -11,7 +11,7 @@ import io
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 # 讀取 CSV 檔案
-file_path = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AIF_VF_D.csv'
+file_path = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AIF_VF_D.csv'
 
 try:
     data = pd.read_csv(file_path)
