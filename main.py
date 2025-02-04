@@ -126,8 +126,7 @@ except Exception as e:
     datasheet_latest_four = pd.DataFrame(columns=['Type Name', 'TimeStamp', 'Version'])
 
 # 定義 Dash 應用程式
-app = Dash(__name__, suppress_callback_exceptions=True, external_stylesheets=[dbc.themes.BOOTSTRAP])
-app.title = "Power Module Datasheet"
+
 
 # 定義導航欄 (navbar)
 navbar = html.Div(
