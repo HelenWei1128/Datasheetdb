@@ -19,6 +19,11 @@ import requests
 # 設置日誌記錄
 logging.basicConfig(level=logging.INFO)
 
+external_stylesheets = [dbc.themes.BOOTSTRAP, '/assets/styles.css']
+app = Dash(__name__, external_stylesheets=external_stylesheets, suppress_callback_exceptions=True)
+app.title = "Power Module Datasheet"
+server = app.server
+
 # 忽略 SSL 驗證（僅建議在開發環境使用，生產環境應移除此行以確保安全）
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -83,8 +88,19 @@ datasheet_csv_path = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb
 
 
 
-if os.path.exists(datasheet_csv_path):
-    datasheet_df = pd.read_csv(datasheet_csv_path)
+try:
+    # 如果路徑是 URL，則使用 requests 下載檔案內容
+    if datasheet_csv_path.startswith("http://") or datasheet_csv_path.startswith("https://"):
+        response = requests.get(datasheet_csv_path)
+        response.raise_for_status()  # 若下載失敗則拋出例外
+        datasheet_df = pd.read_csv(io.StringIO(response.text))
+    else:
+        # 本地檔案情況，先檢查是否存在
+        if os.path.exists(datasheet_csv_path):
+            datasheet_df = pd.read_csv(datasheet_csv_path)
+        else:
+            raise FileNotFoundError(f"找不到檔案 {datasheet_csv_path}")
+
     # 確保 'Type Name', 'TimeStamp', 'Version' 欄位存在
     required_columns = ['Type Name', 'TimeStamp', 'Version']
     if all(col in datasheet_df.columns for col in required_columns):
@@ -105,8 +121,8 @@ if os.path.exists(datasheet_csv_path):
     else:
         print("錯誤：'Datasheetdatalist.csv' 缺少必要的欄位。")
         datasheet_latest_four = pd.DataFrame(columns=['Type Name', 'TimeStamp', 'Version'])
-else:
-    print(f"錯誤：找不到檔案 {datasheet_csv_path}")
+except Exception as e:
+    print(f"錯誤：無法讀取 CSV 檔案 {datasheet_csv_path}: {e}")
     datasheet_latest_four = pd.DataFrame(columns=['Type Name', 'TimeStamp', 'Version'])
 
 # 定義 Dash 應用程式
@@ -2461,9 +2477,7 @@ if __name__ == "__main__":
         # 假設 app 是已建立的 Dash 應用
         app.run_server(debug=True)
 
-        app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP, '/assets/styles.css'],
-                        suppress_callback_exceptions=True)
-        server = app.server  # 如果需要部署到伺服器
+
 
     except FileNotFoundError as e:
         logging.error(e)
