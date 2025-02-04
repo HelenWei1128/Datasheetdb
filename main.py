@@ -1,116 +1,815 @@
+import subprocess
 import dash
-from dash import dcc, html, dash_table
-from dash.dependencies import Input, Output, State
+import dash_ag_grid as dag
 import dash_bootstrap_components as dbc
-import pandas as pd
-import numpy as np
+from dash import dash_table
 import plotly.graph_objects as go
-from scipy.optimize import curve_fit
+from dash import Dash, html, dcc, Input, Output, callback, State, ALL
+import ssl
+import pandas as pd
+import re
+import os
 import base64
 import io
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-import matplotlib.pyplot as plt
-from IFVF02 import encoded_image
+import json
+from dash.exceptions import PreventUpdate
+import logging
+import requests
 
-# 創建 Dash 應用，並設置 external_stylesheets 指向 Bootstrap 和自定義 CSS
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP, '/assets/styles.css'],
-                suppress_callback_exceptions=True)
-server = app.server  # 如果需要部署到伺服器
+# 設置日誌記錄
+logging.basicConfig(level=logging.INFO)
 
-# 固定數據文件路徑（右側損耗分析）
-#DATA_FILE_PATH = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AIC_VCE_A.csv'  # 修改為您的文件路徑
+# 忽略 SSL 驗證（僅建議在開發環境使用，生產環境應移除此行以確保安全）
+ssl._create_default_https_context = ssl._create_unverified_context
 
-DATA_FILE_PATH = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AIC_VCE_A.csv'
-DATA_FILE_PATH1 = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AIC_VCE_family_25C_B.csv'
-DATA_FILE_PATH3 = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AIF_VF_D.csv'
-DATA_FILE_PATH4 = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AEon&Eoff(IC)_E.csv'  # 修改為您的文件路徑
-DATA_FILE_PATH5 = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AEon&Eoff(Rg)_F.csv'  # 修改為您的文件路徑
-DATA_FILE_PATH6 = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AErec(Rg)_J.csv'  # 修改為您的文件路徑
-DATA_FILE_PATH7 = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AGatecharge_L.csv'  # 修改為您的文件路徑
-DATA_FILE_PATH8 = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AZthtrialIGBT_M.csv'  # 修改為您的文件路徑
+# 讀取主要資料
+csv_url = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/main/Datasheetdata04.csv'
+df = pd.read_csv(csv_url)
 
-#DATA_FILE_PATH1 = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AIC_VCE_family_25C_B.csv'  # 修改為您的文件路徑
-#DATA_FILE_PATH3 = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AIF_VF_D.csv'  # 修改為您的文件路徑
-#DATA_FILE_PATH4 = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AEon&Eoff(IC)_E.csv'  # 修改為您的文件路徑
-#DATA_FILE_PATH5 = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AEon&Eoff(RG)_F.csv'  # 修改為您的文件路徑
-#DATA_FILE_PATH6 = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AErec(RG)_J.csv'  # 修改為您的文件路徑
-#DATA_FILE_PATH7 = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AGatecharge_L.csv'  # 修改為您的文件路徑
-#DATA_FILE_PATH8 = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AZthtrialIGBT_M.csv'  # 修改為您的文件路徑
+# 去除欄位名稱的前後空白
+df.columns = df.columns.str.strip()
 
+# 確認 'Report Link' 欄位是否存在並處理
+if 'Report Link' in df.columns:
+    df['Report Link'] = df['Report Link'].fillna('')
+    df['Report Link'] = df['Report Link'].apply(lambda x: f'[Report]({x})' if x else '')
+else:
+    df['Report Link'] = df['Parameter'].apply(
+        lambda x: f'https://example.com/reports/{x.split("//")[-1].replace("/", "-")}' if pd.notna(x) else ''
+    )
+    df['Report Link'] = df['Report Link'].apply(lambda x: f'[Report]({x})' if x else '')
 
+# 修改欄位名稱
+df.rename(columns={'Q1 Men': 'Q1 Male'}, inplace=True)
 
-# 解析上傳文件的函數
-def parse_contents(contents, filename):
-    ALLOWED_EXTENSIONS = {'csv', 'xls', 'xlsx'}
+# 嘗試自動解析 TimeStamp 欄位的日期時間格式
+if 'TimeStamp' in df.columns:
     try:
-        content_type, content_string = contents.split(',')
-        decoded = base64.b64decode(content_string)
-        extension = filename.split('.')[-1].lower()
-        if extension not in ALLOWED_EXTENSIONS:
-            raise ValueError("不支持的文件類型")
-        if 'csv' in extension:
+        df['TimeStamp'] = pd.to_datetime(df['TimeStamp'], errors='coerce')  # 自動解析日期格式
+        df['Report Year'] = df['TimeStamp'].dt.year
+    except Exception as e:
+        print(f"日期解析失敗: {e}")
+else:
+    print("錯誤：找不到 'TimeStamp' 欄位。")
+    exit(1)
+
+# 獲取唯一的 Power 名稱，排除 NaN 並確保為字串，並進行排序
+unique_powers = ['All'] + sorted(
+    df["Power"].dropna().astype(str).unique(),
+    key=lambda x: float(re.findall(r'(\d+)V', x)[0]) if re.findall(r'(\d+)V', x) else float('inf')
+)
+
+# 獲取唯一的模組名稱，排除 NaN 並確保為字串，並進行排序
+unique_modules = ['All'] + sorted(df["Module"].dropna().astype(str).unique())
+
+# 設定預設選擇
+default_power = 'All'
+default_module = 'All'
+
+# 定義數值欄位
+numeric_columns = [
+    'Parameter', 'Report Year',
+    'Conditions', 'Symbol', 'Values', 'Min', 'Typ', 'Max', 'Unit', 'User', 'TimeStamp', 'Version'
+]
+
+# 獲取最新一筆 datasheet 資料
+latest_datasheet = df.sort_values(by='TimeStamp', ascending=False).head(1)
+
+# 獲取最新四筆模組更新資料，僅包含 'Type Name'、'TimeStamp' 和 'Version'
+latest_four = df.sort_values(by='TimeStamp', ascending=False).head(4)[['Type Name', 'TimeStamp', 'Version']]
+
+# 讀取 Datasheetdatalist.csv 並處理
+datasheet_csv_path = '/Users/helen/PycharmProjects/Simulation_Tools/data/Datasheetdatalist.csv'
+
+
+
+if os.path.exists(datasheet_csv_path):
+    datasheet_df = pd.read_csv(datasheet_csv_path)
+    # 確保 'Type Name', 'TimeStamp', 'Version' 欄位存在
+    required_columns = ['Type Name', 'TimeStamp', 'Version']
+    if all(col in datasheet_df.columns for col in required_columns):
+        try:
+            # 嘗試自動解析 TimeStamp 欄位的日期時間格式
+            datasheet_df['TimeStamp'] = pd.to_datetime(datasheet_df['TimeStamp'], errors='coerce')
+        except Exception as e:
+            print(f"Datasheet TimeStamp 解析失敗: {e}")
+
+        # 排序並取得最新四筆資料
+        datasheet_latest_four = datasheet_df.sort_values(by='TimeStamp', ascending=False).head(4)
+        # 將 TimeStamp 轉換為字串以確保 DataTable 正確顯示
+        datasheet_latest_four['TimeStamp'] = datasheet_latest_four['TimeStamp'].dt.strftime('%Y-%m-%d')
+        # 格式化 'Type Name' 為可點擊的連結並添加圖示
+        datasheet_latest_four['Type Name'] = datasheet_latest_four['Type Name'].apply(
+            lambda x: f"![icon](/assets/inbox-document-text.png) [{x}](#)"
+        )
+    else:
+        print("錯誤：'Datasheetdatalist.csv' 缺少必要的欄位。")
+        datasheet_latest_four = pd.DataFrame(columns=['Type Name', 'TimeStamp', 'Version'])
+else:
+    print(f"錯誤：找不到檔案 {datasheet_csv_path}")
+    datasheet_latest_four = pd.DataFrame(columns=['Type Name', 'TimeStamp', 'Version'])
+
+# 定義 Dash 應用程式
+app = Dash(__name__, suppress_callback_exceptions=True, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.title = "Power Module Datasheet"
+
+# 定義導航欄 (navbar)
+navbar = html.Div(
+    style={
+        'backgroundColor': '#f8f9fa',
+        'padding': '10px 20px',
+        'borderBottom': '1px solid #dee2e6',
+        'display': 'flex',
+        'justifyContent': 'space-between',
+        'alignItems': 'center',
+        'marginBottom': '0'  # 移除與下方區塊的間隙
+    },
+    children=[
+        html.Div(
+            "Power Module Datasheet",
+            style={'fontSize': '22px', 'fontWeight': 'bold', 'color': '#495057'}
+        ),
+        html.Div(
+            children=[
+                dcc.Link(
+                    "Home", href='/',
+                    style={
+                        'margin': '0 10px',
+                        'textDecoration': 'none',
+                        'color': '#495057',
+                        'fontSize': '16px'
+                    }
+                ),
+                dbc.DropdownMenu(
+                    label="Diagrams",
+                    children=[
+                        dbc.DropdownMenuItem("Diagrams 1", href='/diagrams1'),
+                        dbc.DropdownMenuItem("Diagrams 2", href='/diagrams2'),
+                        dbc.DropdownMenuItem("Diagrams 3", href='/diagrams3'),
+                    ],
+                    style={'margin': '0 10px', 'cursor': 'pointer'},
+                    nav=True,
+                ),
+                dcc.Link(
+                    "Contact", href='/contact',
+                    style={
+                        'margin': '0 10px',
+                        'textDecoration': 'none',
+                        'color': '#495057',
+                        'fontSize': '16px'
+                    }
+                ),
+            ],
+            style={'display': 'flex', 'alignItems': 'center'}
+        )
+    ]
+)
+
+# 定義 About 區塊（新增顯示最新四筆模組更新及 Datasheet 資料）
+about_section = html.Div(
+    style={
+        'backgroundColor': '#f8f9fa',
+        'padding': '20px',
+        'borderRadius': '8px',
+        'marginBottom': '0',  # 移除與下方的空隙
+        'marginTop': '0',  # 確保沒有上方空隙
+        'boxShadow': '0px 1px 3px rgba(0, 0, 0, 0.1)'
+    },
+    children=[
+        html.H2("About", style={'fontSize': '22px', 'fontWeight': 'bold', 'marginBottom': '10px'}),
+        html.P(
+            "Datasheet Module Database",
+            style={'fontSize': '16px', 'color': '#6c757d'}
+        ),
+
+        # 新增的 Datasheet 區塊
+        html.Div(
+            [
+                html.P("Recent Updates Status", style={'fontWeight': 'bold', 'marginBottom': '5px', 'textAlign': 'left'}),
+                dash_table.DataTable(
+                    id='datasheet-table',
+                    columns=[
+                        {"name": "Type Name", "id": "Type Name", "presentation": "markdown"},  # 保留 markdown
+                        {"name": "TimeStamp", "id": "TimeStamp"},
+                        {"name": "Version", "id": "Version"}
+                    ],
+                    data=datasheet_latest_four.to_dict('records'),
+                    style_cell={
+                        'textAlign': 'left',  # 所有欄位水平左對齊
+                        'padding': '5px',    # 增加單元格內邊距
+                        'fontSize': '14px',   # 調整字體大小
+                        'fontFamily': 'Arial, sans-serif',  # 使用 Arial 字體
+                        'verticalAlign': 'middle'  # 垂直居中對齊
+                     },
+                    style_cell_conditional=[
+                        {
+                             'if': {'column_id': 'Type Name'},
+                             'textAlign': 'center'  # 將 Type Name 欄位置中
+                        }
+                    ],
+                    style_header={
+                        'backgroundColor': '#f8f9fa',
+                        'fontWeight': 'bold'
+                    },
+                    style_as_list_view=True,
+                    markdown_options={'html': True},  # 保留 HTML 支援
+                    page_size=4,
+                    style_table={
+                        'width': '100%',  # 讓表格占滿容器寬度
+                        'border': 'none',
+                        'boxShadow': '0px 1px 3px rgba(0, 0, 0, 0.1)',
+                        'borderRadius': '8px'
+                    },
+                    style_data_conditional=[
+                        {
+                            'if': {'column_id': 'Type Name'},
+                            'color': '#007bff',
+                            'textDecoration': 'none',  # 移除底線
+                            'cursor': 'pointer'
+                        }
+                    ],
+                )
+            ],
+            style={'fontSize': '16px', 'color': '#495057', 'marginBottom': '10px'}
+        ),
+        html.Div(
+            [
+                dcc.Link("Test1", href='/run-hh4any', style={'display': 'block', 'marginBottom': '5px'}),
+                dcc.Link("Test2", href='#', style={'display': 'block'}),
+            ],
+            style={'fontSize': '16px', 'color': '#007bff'}
+        )
+    ]
+)
+
+# 定義下拉選單 - Power
+power_dropdown = html.Div(
+    [
+        dbc.Label("Select a Power", html_for="power-dropdown"),
+        dcc.Dropdown(
+            id="power-dropdown",
+            options=[{'label': name, 'value': name} for name in unique_powers],
+            value=default_power,
+            clearable=False,
+            maxHeight=600,
+            optionHeight=50,
+            style={'fontSize': '16px', 'color': '#495057', 'marginBottom': '10px'}
+        ),
+    ], className="mb-4",
+)
+
+# 定義下拉選單 - Module
+module_dropdown = html.Div(
+    [
+        dbc.Label("Select a Module", html_for="module-dropdown"),
+        dcc.Dropdown(
+            id="module-dropdown",
+            options=[{'label': name, 'value': name} for name in unique_modules],
+            value=default_module,
+            clearable=False,
+            maxHeight=600,
+            optionHeight=50,
+            style={'fontSize': '16px', 'color': '#495057', 'marginBottom': '10px'}
+        ),
+    ], className="mb-4",
+)
+
+# 定義年選擇按鈕
+year_radio = html.Div(
+    [
+        dbc.Label("Select Year", html_for="year-radio"),
+        dbc.RadioItems(
+            options=[{'label': str(int(year)), 'value': int(year)} for year in sorted(df['Report Year'].dropna().unique())],
+            value=int(sorted(df['Report Year'].dropna().unique(), reverse=True)[0]),
+            id="year-radio",
+            style={'fontSize': '16px', 'color': '#495057', 'marginBottom': '10px'}
+        ),
+    ],
+    className="mb-4",
+)
+
+# 定義 AgGrid 表格（主 AgGrid）
+grid = html.Div(
+    dag.AgGrid(
+        id="grid",
+        rowData=df.to_dict("records"),  # 初始顯示所有資料
+        columnDefs=[
+            {"field": "Module", "cellRenderer": "markdown", "linkTarget": "_blank", "initialWidth": 190,
+             "pinned": "left",
+             "cellStyle": {"textAlign": "center"}},
+            {"field": "Power", "cellRenderer": "markdown", "linkTarget": "_blank", "floatingFilter": False},
+            {"field": "Type Name", "cellRenderer": "markdown", "linkTarget": "_blank",
+             "floatingFilter": False},
+            {"field": "Item"}
+        ] + [{"field": c} for c in numeric_columns],
+        defaultColDef={
+            "filter": True,
+            "floatingFilter": True,
+            "wrapHeaderText": True,
+            "autoHeaderHeight": True,
+            "initialWidth": 125,
+            "headerClass": "header-centered"
+        },
+        dashGridOptions={
+            "pagination": True,
+            "paginationPageSize": 20
+        },
+        filterModel={'Report Year': {'filterType': 'number', 'type': 'equals', 'filter': 2024}},
+        rowClassRules={
+            "bg-secondary text-dark bg-opacity-25": "params.node.rowPinned === 'top' || params.node.rowPinned === 'bottom'"
+        },
+        style={"height": 1000, "width": "100%"}
+    ),
+    style={
+        'backgroundColor': '#f8f9fa',
+        'padding': '20px',
+        'borderRadius': '8px',  # 修改邊角與 About 一致
+        'marginBottom': '0',  # 移除與其他區塊的空隙
+        'boxShadow': '0px 1px 3px rgba(0, 0, 0, 0.1)',
+        'border': '1px solid #e9ecef',
+        'marginTop': '-9px'  # 向上移動以減少空隙
+    }
+)
+
+# 定義控制面板
+control_panel = dbc.Card(
+    dbc.CardBody(
+        [
+            about_section,
+            year_radio,
+            module_dropdown,
+            power_dropdown,
+        ],
+        className="bg-light",
+    ),
+    style={
+        'marginBottom': '0',
+        'boxShadow': '0px 1px 3px rgba(0, 0, 0, 0.1)',
+        'border': '1px solid #e9ecef',
+        'marginTop': '0',  # 調整以減少與上方導航欄的距離
+        'padding': '0'  # 確保 About 和其他區塊緊密對齊
+    }
+)
+
+# 定義 Accordion (info)
+info = dbc.Accordion([
+    dbc.AccordionItem(dcc.Markdown(
+        """
+         Datasheet Module Database Beta is a pre-release version designed to support every stage of development.
+
+         It enables teams to quickly search for and download the component information they need, simplifying the process of testing and validating designs.
+
+         While there may be some minor issues or limitations, your feedback is invaluable in helping us improve and refine the system.
+
+         Together, we’re building a tool to make your development process faster and more efficient!
+        """
+    ), title="Application Development", className="mb-1"),
+
+    dbc.AccordionItem(
+        html.Div([
+            # Datasheet 資料查詢與管理
+            dbc.Button(
+                "・Datasheet Query & Management",
+                id="collapse-datasheet-button",
+                color="transparent",  # 移除 link 顏色
+                style={
+                    "whiteSpace": "pre-line",
+                    "padding": "0",
+                    "textAlign": "left",
+                    "fontWeight": "bold",
+                    "textDecoration": "none",  # 移除底線
+                    "border": "none",
+                    "backgroundColor": "transparent",
+                    "color": "#495057",  # 設定文字顏色
+                    "cursor": "pointer"
+                }
+            ),
+            dbc.Collapse(
+                dbc.Card(
+                    dbc.CardBody(
+                        "快速檢索與整理模組的技術規格及參數資料，深入分析與比較。\n"
+                        "Quick retrieval and organization of module technical specifications and parameter data for detailed analysis and comparison."
+                    ),
+                    style={"marginBottom": "10px"}
+                ),
+                id="collapse-datasheet",
+                is_open=False,
+            ),
+
+            # 測試數據可視化繪圖
+            dbc.Button(
+                "・Test Data Visualization & Plotting",
+                id="collapse-visualization-button",
+                color="transparent",
+                style={
+                    "whiteSpace": "pre-line",
+                    "padding": "0",
+                    "textAlign": "left",
+                    "fontWeight": "bold",
+                    "textDecoration": "none",
+                    "border": "none",
+                    "backgroundColor": "transparent",
+                    "color": "#495057",
+                    "cursor": "pointer"
+                }
+            ),
+            dbc.Collapse(
+                dbc.Card(
+                    dbc.CardBody(
+                        "測試結果的圖表生成工具，觀察數據趨勢、性能變化和異常點。\n"
+                        "Provides tools for generating charts from test results, enabling observation of data trends, performance variations, and anomalies."
+                    ),
+                    style={"marginBottom": "10px"}
+                ),
+                id="collapse-visualization",
+                is_open=False,
+            ),
+
+            # 圖表與流程圖分析
+            dbc.Button(
+                "・Diagrams Analysis",
+                id="collapse-diagrams-button",
+                color="transparent",
+                style={
+                    "whiteSpace": "pre-line",
+                    "padding": "0",
+                    "textAlign": "left",
+                    "fontWeight": "bold",
+                    "textDecoration": "none",
+                    "border": "none",
+                    "backgroundColor": "transparent",
+                    "color": "#495057",
+                    "cursor": "pointer"
+                }
+            ),
+            dbc.Collapse(
+                dbc.Card(
+                    dbc.CardBody(
+                        "支援多種類型的圖表和結構流程圖分析，幫助解讀產品架構與系統設計。\n"
+                        "Supports analysis of various types of charts and structural diagrams to interpret product architecture and system design."
+                    ),
+                    style={"marginBottom": "10px"}
+                ),
+                id="collapse-diagrams",
+                is_open=False,
+            ),
+
+            # 技術對標與性能評估
+            dbc.Button(
+                "・Technical Benchmarking & Performance",
+                id="collapse-benchmarking-button",
+                color="transparent",
+                style={
+                    "whiteSpace": "pre-line",
+                    "padding": "0",
+                    "textAlign": "left",
+                    "fontWeight": "bold",
+                    "textDecoration": "none",
+                    "border": "none",
+                    "backgroundColor": "transparent",
+                    "color": "#495057",
+                    "cursor": "pointer"
+                }
+            ),
+            dbc.Collapse(
+                dbc.Card(
+                    dbc.CardBody(
+                        "基於數據進行跨產品或競品的性能對標與技術評估，助力產品改進與策略制定。\n"
+                        "Conducts data-driven benchmarking and technical evaluations across products or competitors to facilitate product improvements and strategy development."
+                    ),
+                    style={"marginBottom": "10px"}
+                ),
+                id="collapse-benchmarking",
+                is_open=False,
+            ),
+        ]),
+        title="Interface Function",
+        className="mb-1"  # 修改為更緊湊的下邊距
+    ),
+
+    dbc.AccordionItem(
+        html.Div(
+            style={
+                'backgroundColor': '#f8f9fa',
+                'padding': '20px',
+                'borderRadius': '8px',
+                'marginBottom': '20px',
+                'boxShadow': '0px 1px 3px rgba(0, 0, 0, 0.1)'
+            },
+            children=[
+                html.H2("Beta 0.0", style={'fontSize': '24px', 'fontWeight': 'bold', 'marginBottom': '10px'}),
+                html.P("測試版本", style={'fontSize': '16px', 'color': '#6c757d'})
+            ]
+        ),
+        title="Version",
+        className="mb-1"  # 修改為更緊湊的下邊距
+    )
+], start_collapsed=True, className="mb-4")  # 保持 Accordion 的下邊距
+
+# 定義下方控制面板
+# 定義 Toggle Analyze 區塊（保留註解，因為用戶要求不改動其他功能）
+# toggle_analyze_section = html.Div(
+#     [
+#         dbc.Button("Toggle Analyze", id="toggle-analyze", color="primary", className="mt-2"),
+#         dbc.Collapse(
+#             html.Div(id="bar-chart-card", className="mt-4"),
+#             id="analyze-collapse",
+#             is_open=False
+#         ),
+#     ],
+#     style={
+#         'backgroundColor': '#f8f9fa',
+#         'padding': '20px',
+#         'borderRadius': '8px',
+#         'marginBottom': '20px',
+#         'boxShadow': '0px 1px 3px rgba(0, 0, 0, 0.1)'
+#     }
+# )
+
+# 定義 Pay Gap 和 Bonus Gap 卡片的佈局，並在卡片之間添加間隔
+paygap_bonusgap_cards = dbc.Row([
+    dbc.Col(html.Div(id="paygap-card"), className="mb-3"),
+    dbc.Col(html.Div(id="bonusgap-card"), className="mb-3")
+], className="mb-4")
+
+# 定義 Home 頁面的布局
+home_layout = dbc.Container(
+    [
+        dbc.Row([
+            dbc.Col([
+                control_panel,
+                info,
+                # toggle_analyze_section,  # 保留註解
+                paygap_bonusgap_cards,
+            ], md=3, style={'paddingRight': '10px', 'paddingTop': '0px', 'marginBottom': '0px'}),  # 調整 padding 和 margin
+            dbc.Col([
+                dcc.Markdown(id="title"),
+                html.Div(id="no-data-message", className="text-danger mt-2"),
+                grid
+            ], md=9, style={'paddingLeft': '10px', 'paddingTop': '0px', 'marginBottom': '0px'})  # 調整 padding 和 margin
+        ]),
+    ],
+    fluid=True,
+    style={'padding': '0px', 'margin': '0px'}  # 確保容器的 padding 和 margin 為 0
+)
+
+# ================== Diagrams3 頁面的整合開始 ==================
+
+# 定義公司和競爭對手的 PDF 檔案對應表（使用相對路徑）
+
+company_pdfs = {
+    "AEP820B08TFLTMM":"https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/main/2024AEP820B08TFLTMM0909.pdf"
+}
+
+competitor_pdfs = {
+    "競爭者測試":"https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/main/test.pdf"
+}
+
+# 對標競爭分析數據（示例數據，根據需要修改）
+benchmark_data = [
+    {"Parameter": "產品特性", "Company": "高", "Competitor A": "中", "Competitor B": "高", "Competitor C": "低"},
+    {"Parameter": "價格策略", "Company": "中", "Competitor A": "高", "Competitor B": "低", "Competitor C": "中"},
+    {"Parameter": "市場份額", "Company": "25%", "Competitor A": "30%", "Competitor B": "20%", "Competitor C": "15%"},
+    {"Parameter": "客戶滿意度", "Company": "90%", "Competitor A": "85%", "Competitor B": "80%", "Competitor C": "70%"},
+    {"Parameter": "銷售量", "Company": "1,000", "Competitor A": "1,200", "Competitor B": "800", "Competitor C": "600"},
+    {"Parameter": "分銷渠道", "Company": "多", "Competitor A": "中", "Competitor B": "少", "Competitor C": "多"},
+    {"Parameter": "品牌影響力", "Company": "高", "Competitor A": "高", "Competitor B": "中", "Competitor C": "低"}
+]
+
+# 定義對標競爭分析的欄位
+benchmark_columns = [
+    {"name": "Parameter", "id": "Parameter"},
+    {"name": "Company", "id": "Company"},
+    {"name": "Competitor A", "id": "Competitor A"},
+    {"name": "Competitor B", "id": "Competitor B"},
+    {"name": "Competitor C", "id": "Competitor C"}
+]
+
+# 定義解析上傳文件的函數
+def parse_contents(contents, filename):
+    if contents is None:
+        return None
+    content_type, content_string = contents.split(',')
+    decoded = base64.b64decode(content_string)
+    try:
+        if 'csv' in filename:
             return pd.read_csv(io.StringIO(decoded.decode('utf-8')))
-        elif 'xls' in extension:
+        elif 'xls' in filename:
             return pd.read_excel(io.BytesIO(decoded))
     except Exception as e:
         print(f"Error parsing {filename}: {e}")
         return None
 
-# 從固定路徑讀取數據的函數
-def load_data(file_path):
-    try:
-        df = pd.read_csv(file_path)
-        return df
-    except Exception as e:
-        print(f"Error loading data from {file_path}: {e}")
-        return pd.DataFrame()  # 返回空的 DataFrame
+# 定義回調函數：當公司下拉選單改變時更新公司 PDF 和下載按鈕
+def callbacks_diagrams3(app):
+    # 回調函數：當公司下拉選單改變時更新公司 PDF 和下載按鈕
+    @app.callback(
+        [
+            Output('company-pdf', 'src'),
+            Output('download-company-pdf-btn', 'style')
+        ],
+        Input('company-dropdown', 'value')
+    )
+    def update_company_pdf(selected_url):
+        if selected_url:
+            # 使用相對路徑
+            return selected_url, {'display': 'inline-block'}
+        # 如果未選擇，清空 iframe 並隱藏下載按鈕
+        return "", {'display': 'none'}
 
-# 熱阻分析 (Thermal Resistance)
-def calc_thermal_resistance(Tj, Pd):
-    Tc = 25  # 假設環境溫度為常數25℃
-    Tj = np.array(Tj)
-    Pd = np.array(Pd)
-    return (Tj - Tc) / Pd
+    # 回調函數：下載公司 PDF（本地文件）
+    @app.callback(
+        Output("download-company-pdf", "data"),
+        Input("download-company-pdf-btn", "n_clicks"),
+        State('company-dropdown', 'value'),
+        prevent_initial_call=True,
+    )
+    def download_company_pdf(n_clicks, selected_url):
+        if n_clicks and selected_url:
+            try:
+                # 將相對路徑轉換為本地文件系統路徑
+                file_path = os.path.join(os.getcwd(), selected_url)
+                if not os.path.exists(file_path):
+                    logging.error(f"文件不存在: {file_path}")
+                    return dash.no_update
+                # 讀取本地 PDF 文件
+                with open(file_path, 'rb') as f:
+                    pdf_bytes = f.read()
+                return dcc.send_bytes(pdf_bytes, os.path.basename(file_path))
+            except Exception as e:
+                logging.error(f"讀取公司文件時出錯: {e}")
+                return dash.no_update
+        return dash.no_update
 
-# 開關損耗分析 (Switching Loss)
-def calc_switching_loss(VCE, IC, switching_time):
-    return 0.5 * VCE * IC * switching_time
+    # 回調函數：當競爭對手下拉選單改變時更新競爭對手 PDF 和下載按鈕
+    @app.callback(
+        [
+            Output('competitor-pdf', 'src'),
+            Output('download-competitor-pdf-btn', 'style')
+        ],
+        Input('competitor-dropdown', 'value')
+    )
+    def update_competitor_pdf(selected_url):
+        if selected_url:
+            # 使用相對路徑
+            return selected_url, {'display': 'inline-block'}
+        # 如果未選擇，清空 iframe 並隱藏下載按鈕
+        return "", {'display': 'none'}
 
-# 導通損耗 (Conduction Loss)
-def calc_conduction_loss(VCE, IC):
-    return VCE * IC
+    # 回調函數：下載競爭對手 PDF（本地文件）
+    @app.callback(
+        Output("download-competitor-pdf", "data"),
+        Input("download-competitor-pdf-btn", "n_clicks"),
+        State('competitor-dropdown', 'value'),
+        prevent_initial_call=True,
+    )
+    def download_competitor_pdf(n_clicks, selected_url):
+        if n_clicks and selected_url:
+            try:
+                # 將相對路徑轉換為本地文件系統路徑
+                file_path = os.path.join(os.getcwd(), selected_url)
+                if not os.path.exists(file_path):
+                    logging.error(f"文件不存在: {file_path}")
+                    return dash.no_update
+                # 讀取本地 PDF 文件
+                with open(file_path, 'rb') as f:
+                    pdf_bytes = f.read()
+                return dcc.send_bytes(pdf_bytes, os.path.basename(file_path))
+            except Exception as e:
+                logging.error(f"讀取競爭對手文件時出錯: {e}")
+                return dash.no_update
+        return dash.no_update
 
-# 靜態電阻 (Static Resistance)
-def calc_static_resistance(VCE, IC):
-    return VCE / IC
+    # 回調函數：下載對標競爭分析為 CSV
+    @app.callback(
+        Output("download-dataframe-csv", "data"),
+        Input("download-button", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def download_csv(n_clicks):
+        if n_clicks:
+            df = pd.DataFrame(benchmark_data)
+            return dcc.send_data_frame(df.to_csv, "benchmark_data.csv")
+        return dash.no_update
 
-# 數據趨勢分析與擬合 (Data Trend and Curve Fitting)
-def linear_model(VCE, a, b):
-    return a * VCE + b
+    return
 
-# 定義擬合函數
-def poly3_func(x, a, b, c, d):
-    return a * x ** 3 + b * x ** 2 + c * x + d
+# 定義 Diagrams3 頁面的佈局
+diagrams3_layout = dbc.Container([
+    dbc.Row([
+        # 左側框架（公司）
+        dbc.Col([
+            html.H3("Actron Datasheet"),
+            dcc.Dropdown(
+                id='company-dropdown',
+                options=[{'label': k, 'value': v} for k, v in company_pdfs.items()],
+                placeholder="Select Datasheet",
+                style={'margin-bottom': '20px'}
+            ),
+            html.Iframe(
+                id='company-pdf',
+                src="",  # 初始為空
+                style={"width": "100%", "height": "600px", "border": "none"}
+            ),
+            # 下載按鈕（本地 PDF）
+            dbc.Button("下載 PDF", id='download-company-pdf-btn', color="primary", className="mt-2", style={'display': 'none'}),
+            # 下載組件（本地 PDF）
+            dcc.Download(id='download-company-pdf')
+        ], width=6),
 
-# 計算 R² 的函數
-def calculate_r_squared(y_true, y_pred):
-    residuals = y_true - y_pred
-    ss_res = np.sum(residuals ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    r_squared = 1 - (ss_res / ss_tot)
-    return r_squared
+        # 右側框架（競爭對手）
+        dbc.Col([
+            html.H3("Benchmarking Reference Materials"),
+            dcc.Dropdown(
+                id='competitor-dropdown',
+                options=[{'label': k, 'value': v} for k, v in competitor_pdfs.items()],
+                placeholder="選擇競爭對手資料",
+                style={'margin-bottom': '20px'}
+            ),
+            html.Iframe(
+                id='competitor-pdf',
+                src="",  # 初始為空
+                style={"width": "100%", "height": "600px", "border": "none"}
+            ),
+            # 下載按鈕（本地 PDF）
+            dbc.Button("下載 PDF", id='download-competitor-pdf-btn', color="primary", className="mt-2", style={'display': 'none'}),
+            # 下載組件（本地 PDF）
+            dcc.Download(id='download-competitor-pdf')
+        ], width=6),
+    ]),
 
-# 計算點到點斜率的函數
-def calculate_point_to_point_slope(x, y):
-    slopes = np.diff(y) / np.diff(x)
-    return slopes
+    html.Hr(),  # 分隔線
 
-# 定義按鈕樣式為長條矩形
-def create_flet_like_buttons():
+    dbc.Row([
+        dbc.Col([
+            html.H3("對標競爭分析"),
+            dash_table.DataTable(
+                id='benchmark-table',
+                columns=benchmark_columns,
+                data=benchmark_data,
+                style_table={'overflowX': 'auto'},
+                style_header={
+                    'backgroundColor': '#f7f7f7',  # 淺灰色背景
+                    'fontWeight': 'bold',
+                    'border': '1px solid #ddd'
+                },
+                style_cell={
+                    'padding': '10px',
+                    'textAlign': 'left',
+                    'minWidth': '150px', 'width': '150px', 'maxWidth': '150px',
+                    'backgroundColor': '#ffffff',
+                    'border': '1px solid #ddd',
+                    'fontFamily': 'Arial, sans-serif',
+                    'fontSize': '14px',
+                },
+                filter_action="native",  # 啟用過濾
+                sort_action="native",  # 啟用排序
+                page_action="none",  # 不啟用分頁，因為數據量不大
+                style_data_conditional=[]
+            ),
+            dbc.Button("下載表格為 CSV", id="download-button", color="secondary", className="mt-3"),
+            dcc.Download(id="download-dataframe-csv")
+        ], width=12)
+    ], style={'margin-top': '50px'})
+], fluid=True)
+
+# 定義 Diagrams2 頁面的佈局（空白頁）
+diagrams2_layout = dbc.Container([
+    html.H2("Diagrams 2"),
+    html.P("這是 Diagrams 2 的空白頁。"),
+
+    # 一開始就啟動另一個 python 進程，執行 hh4any.py
+    #html.Div(id='subprocess-feedback'),
+], fluid=True)
+
+# 定義 Diagrams1 頁面的佈局（整合 diagrams1 的內容）
+def create_upload_card(card_title, subtitle, upload_id, graph_id):
+    return dbc.Card(
+        dbc.CardBody([
+            html.H5(card_title, className="card-title", style={'textAlign': 'left'}),
+            html.H6(subtitle, className="card-subtitle mb-2 text-muted", style={'textAlign': 'left'}),
+            dcc.Upload(
+                id=upload_id,
+                children=html.Div(['Drag and Drop or ', html.A('Select Files')]),
+                style={
+                    'width': '100%', 'height': '60px', 'lineHeight': '60px',
+                    'borderWidth': '1px', 'borderStyle': 'dashed',
+                    'borderRadius': '5px', 'textAlign': 'center', 'margin': '10px'
+                }
+            ),
+            dcc.Graph(id=graph_id, config={'displayModeBar': False}),
+            # 新增按鈕區域，傳入 graph_id 以便創建唯一 ID
+            create_flet_like_buttons(graph_id)
+        ]),
+        className="shadow-sm border mb-4"
+    )
+
+def create_flet_like_buttons(graph_id):
     return dbc.Row([
         dbc.Col(
             dbc.Button(
-                "Button 1",
+                "Data",
+                id={'type': 'Data', 'index': graph_id},  # graph_id 例如 'graph-tj25'
                 color="primary",
                 style={
                     'borderRadius': '10px',
@@ -118,13 +817,15 @@ def create_flet_like_buttons():
                     'margin': '5px',
                     'boxShadow': '2px 2px 5px rgba(0,0,0,0.3)'
                 },
-                className="me-2"
+                className="me-2",
+                n_clicks=0
             ),
             width="auto"
         ),
         dbc.Col(
             dbc.Button(
-                "Button 2",
+                "Save Picture",
+                id={'type': 'button2', 'graph_id': graph_id},
                 color="secondary",
                 style={
                     'borderRadius': '10px',
@@ -132,5020 +833,1638 @@ def create_flet_like_buttons():
                     'margin': '5px',
                     'boxShadow': '2px 2px 5px rgba(0,0,0,0.3)'
                 },
-                className="me-2"
+                className="me-2",
+                n_clicks=0
             ),
             width="auto"
         )
     ], justify="start", className="g-0")
 
-# 創建上傳卡片，增加參數以控制是否包含按鈕，以及圖表和卡片的樣式
-def create_upload_card(card_title, subtitle, upload_id, graph_id, dropdown_id, include_buttons=True, graph_style=None,
-                       card_style=None):
-    children = [
-        html.H5(card_title, className="card-title", style={'textAlign': 'left'}),
-        html.H6(subtitle, className="card-subtitle mb-2 text-muted", style={'textAlign': 'left'}),
-
-        # 添加下拉選單
-        html.Div([
-            html.Label("選擇分析項目:", style={'fontSize': '16px', 'font-weight': 'bold'}),
-            dcc.Dropdown(
-                id=dropdown_id,
-                options=[
-                    {'label': 'VGE = 15V, IC = f(VCE)', 'value': 'VGE_15V_IC_f_VCE'},  # 選單一 - 修改 value
-                    {'label': 'Tj = 25°C, IC = f(VCE)', 'value': 'Tj_25C_IC_f_VCE'},  # 選單二
-                    {'label': 'Tj = 150°C, IC = f(VCE)', 'value': 'Tj_150C_IC_f_VCE'},  # 選單三
-                    {'label': 'Tj = 175°C, IC = f(VCE)', 'value': 'Tj_175C_IC_f_VCE'}  # 選單四
-                ],
-                value='Tj_25C_IC_f_VCE',  # 默認選擇選單二
-                clearable=False,
-                style={'width': '100%'}
-            )
-        ], className='custom-dropdown'),
-
-        # 上傳組件
-        dcc.Upload(
-            id=upload_id,
-            children=html.Div(['拖曳檔案或 ', html.A('選擇檔案')]),
-            style={
-                'width': '100%', 'height': '60px', 'lineHeight': '60px',
-                'borderWidth': '1px', 'borderStyle': 'dashed',
-                'borderRadius': '5px', 'textAlign': 'center', 'margin': '10px 0'
-            }
-        ),
-
-        # 圖表
-        dcc.Graph(id=graph_id, style=graph_style)
-    ]
-
-    if include_buttons:
-        children.append(create_flet_like_buttons())
-
-    return dbc.Card(
-        dbc.CardBody(children, style=card_style),  # 添加卡片樣式
-        className="shadow-sm border mb-4"
-    )
-
-# 繪製三次多項式擬合圖並顯示積分區域
-def create_figure(file_path):
-    df = pd.read_csv(file_path)
-    temps = [25, 150, 175]
-    colors = ['gray', 'skyblue', 'navy']
-    markers = ['x', 'x', 'x']
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-    for temp, color, marker in zip(temps, colors, markers):
-        vce_col = f'VCE_Tj = {temp}℃'
-        ic_col = f'IC_Tj = {temp}℃'
-        vce = df[vce_col].dropna()
-        ic = df[ic_col].dropna()
-
-        if len(vce) == 0 or len(ic) == 0:
-            continue  # 跳過沒有數據的溫度
-
-        # 擬合三次多項式
-        try:
-            popt_poly3, _ = curve_fit(poly3_func, vce, ic)
-            vce_fit = np.linspace(min(vce), max(vce), 80)
-            ic_fit_poly3 = poly3_func(vce_fit, *popt_poly3)
-            r_squared_poly3 = calculate_r_squared(ic, poly3_func(vce, *popt_poly3))
-        except Exception as e:
-            print(f"Error fitting data for Tj={temp}℃: {e}")
-            continue
-
-        # 計算線性區域的斜率 (VCE < 1.5V)
-        linear_region_mask = vce < 1.5
-        vce_linear = vce[linear_region_mask]
-        ic_linear = ic[linear_region_mask]
-        if len(vce_linear) > 1:
-            slopes_linear = calculate_point_to_point_slope(vce_linear, ic_linear)
-            average_slope_linear = np.mean(slopes_linear)
-        else:
-            average_slope_linear = np.nan
-
-        # 計算飽和區域的斜率 (VCE >= 1.5V)
-        saturation_region_mask = vce >= 1.5
-        vce_saturation = vce[saturation_region_mask]
-        ic_saturation = ic[saturation_region_mask]
-        if len(vce_saturation) > 1:
-            slopes_saturation = calculate_point_to_point_slope(vce_saturation, ic_saturation)
-            average_slope_saturation = np.mean(slopes_saturation)
-        else:
-            average_slope_saturation = np.nan
-
-        # 繪製原始數據與擬合曲線
-        ax.plot(vce, ic, linestyle='-', color=color, label=f'Tj = {temp}°C')
-        ax.plot(vce_fit, ic_fit_poly3, linestyle=':', color=color, alpha=0.7, label=f'Fit, R² = {r_squared_poly3:.3f}')
-
-        # 計算線性區域的能量
-        energy_linear = np.trapz(ic_linear, vce_linear)
-        ax.fill_between(vce_linear, ic_linear, alpha=0.2, color=color, label=f'Linear Region E = {energy_linear:.0f} J')
-
-        # 計算飽和區域的能量
-        energy_saturation = np.trapz(ic_saturation, vce_saturation)
-        ax.fill_between(vce_saturation, ic_saturation, alpha=0.1, color=color,
-                        label=f'Saturation Region E = {energy_saturation:.0f} J')
-
-        # 添加斜率到圖例
-        if not np.isnan(average_slope_linear):
-            ax.plot([], [], ' ', label=f'Linear Slope = {average_slope_linear:.2f}')
-        if not np.isnan(average_slope_saturation):
-            ax.plot([], [], ' ', label=f'Saturation Slope = {average_slope_saturation:.2f}')
-
-    # 設定圖形標題與標籤
-    ax.set_title('I-V Characteristic Curve & Linear Regions', fontsize=21, fontweight='bold', pad=20)
-    ax.set_xlabel('VCE (V)', fontsize=16, color='black')
-    ax.set_ylabel('IC (A)', fontsize=16, color='black')
-
-    ax.axvline(x=1.5, color='orange', linestyle='--', linewidth=2, label='Saturation Threshold: 1.5 V')
-    ax.text(0.30, ax.get_ylim()[1]*0.1, 'Linear Region', fontsize=12, fontweight='bold')
-    ax.text(2.0, ax.get_ylim()[1]*0.3, 'Saturation Region', fontsize=12, fontweight='bold', color='red')
-
-
-    # 圖例設定
-    ax.legend(loc='upper left', fontsize=10)
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    ax.minorticks_on()
-
-    # 將 matplotlib 圖轉換為 base64
-    img_io = io.BytesIO()
-    FigureCanvas(fig).print_png(img_io)
-    encoded_image = base64.b64encode(img_io.getvalue()).decode()
-
-    plt.close(fig)  # 關閉圖表以釋放資源
-
-    return encoded_image
-
-# 繪製能量損失柱狀圖
-def create_figure_tab2():
-    # 定義功率條件
-    vce_conditions = [1.4, 1.5, 1.6]
-    ic_condition = 820
-
-    power_25_given = vce_conditions[0] * ic_condition
-    power_150_given = vce_conditions[1] * ic_condition
-    power_175_given = vce_conditions[2] * ic_condition
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    temperatures = ['25℃', '150℃', '175℃']
-    energy_values = [power_25_given, power_150_given, power_175_given]
-
-    bars = ax.bar(temperatures, energy_values, color=['gray', 'lightblue', 'navy'], width=0.6)
-    ax.set_xlabel('Junction Temperature (°C)', fontsize=12)
-    ax.set_ylabel('Total Energy Loss (J)', fontsize=12)
-    ax.set_title('Total Energy Loss at Different Junction Temperatures', fontsize=14, fontweight='bold', pad=20)
-
-    for bar in bars:
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width() / 2, height + 10, f'{int(height)} J',
-                ha='center', va='bottom', fontsize=10)
-        ax.axvline(x=bar.get_x() + bar.get_width() / 2, ymin=0, ymax=height / ax.get_ylim()[1],
-                   color='white', linestyle='-', linewidth=1.5, alpha=0.3)
-
-    ax.axhline(y=np.mean(energy_values), color='red', linestyle='--', linewidth=1.5, label='Average Energy Loss')
-    ax.legend(fontsize=10, loc='upper left')
-    ax.yaxis.set_minor_locator(plt.MultipleLocator(100))
-    ax.tick_params(axis='y', which='minor', length=4, labelsize=0)
-
-    # 將 matplotlib 圖轉換為 base64
-    img_io = io.BytesIO()
-    FigureCanvas(fig).print_png(img_io)
-    encoded_image = base64.b64encode(img_io.getvalue()).decode()
-    plt.close(fig)  # 關閉圖表以釋放資源
-    return encoded_image
-
-# 生成 Tab1 圖表的 base64 編碼
-encoded_image_tab1 = create_figure(DATA_FILE_PATH)
-# 生成 Tab2 圖表的 base64 編碼
-encoded_image_tab2 = create_figure_tab2()
-
-
-# 創建損耗分析卡片（右側，從固定路徑讀取數據）
-# 讀取並處理數據
-def load_data_zth(file_path):
-    try:
-        df = pd.read_csv(file_path)
-        return df
-    except Exception as e:
-        print(f"Error loading Zth data from {file_path}: {e}")
-        return pd.DataFrame()  # 返回空的 DataFrame
-
-# Card_8
-def create_loss_analysis_card8():
-    # 讀取數據
-    df = load_data_zth(DATA_FILE_PATH8)
-    if df.empty:
-        print("DataFrame is empty in create_loss_analysis_card8.")  # 偵錯用
-        return go.Figure(), [], []
-
-        # 取出最前、最後一筆
-    first_row = df.iloc[0]
-    last_row = df.iloc[-1]
-
-    # 若有需要自訂 highlight條件，可在此設定
-    # 舉例：標示 t[s] < 1e-5 之類
-
-   # highlight_conditions = [
-        # demo condition
-       # {'t [s]': 1.00E-06, 'ΔTj (t)': 15.36089512},
-   # ]
-
-    style_data_conditional = [
-        {
-            'if': {
-                # 讓「t [s]」和「ΔTj (t)」同時匹配第一筆
-                'filter_query': (
-                    f'{{t [s]}} = {first_row["t [s]"]} '
-                    f'&& {{ΔTj (t)}} = {first_row["ΔTj (t)"]}'
-                )
-            },
-            'backgroundColor': 'lightblue',
-            'color': 'black'
-        },
-        {
-            'if': {
-                # 讓「t [s]」和「ΔTj (t)」同時匹配最後一筆
-                'filter_query': (
-                    f'{{t [s]}} = {last_row["t [s]"]} '
-                    f'&& {{ΔTj (t)}} = {last_row["ΔTj (t)"]}'
-                )
-            },
-            'backgroundColor': 'lightgreen',
-            'color': 'black'
-        }
-    ]
-
-    # 卡片本體
-    return dbc.Card(
-        dbc.CardBody([
-            html.H5("Characteristics Diagrams", className="card-title"),
-            html.H5("Zth, Thermal Impedance vs. time",
-                    style={'textAlign': 'left', 'marginBottom': '16px'}),
-
-
-            # RadioItems 或 Dropdown（看需求）
-            dbc.Row([
-                dbc.Col(
-                    dbc.RadioItems(
-                        options=[
-                            {'label': 'Zth vs t (IGBT)', 'value': 'ZTH_IGBT'}
-                           # {'label': 'Zth vs t (Diode)', 'value': 'ZTH_DIODE'}
-                            # 視需要增減
-                        ],
-                        value='ZTH_IGBT',  # 預設
-                        id='zth-radio8',
-                        inline=True,
-                        className='custom-radio'
-                    ),
-                    width=12,
-                    className='fixed-radio-container'
-                )
-            ], className="mb-3"),
-
-            # 圖片或圖表區
-            html.Div(
-                children=[
-                    # 若是用靜態圖檔
-                    # html.Img(
-                    #     id='zth-image8',
-                    #     src='/assets/ZTH_IGBT.png',
-                    #     style={'width': '70%', 'height': 'auto', 'border': '1px solid lightgray'}
-                    # ),
-
-                    # 若是動態Plotly圖表
-                    dcc.Graph(
-                        id='zth-graph8',
-                        style={'height': '400px'},
-                        config={'displayModeBar': False,  # 顯示工具列
-                                'displaylogo': False  # 是否隱藏 Plotly 的 logo
-                                }
-                    ),
-
-                ],
-                style={'padding': '20px', 'textAlign': 'center'}
-            ),
-
-            html.Div(id='zth-title8',
-                     style={'textAlign': 'center',
-                            'fontSize': '20px',
-                            'marginTop': '10px'}),
-
-            # 範圍滑桿(若有需要)
-            html.Div([
-                html.Label("Time Range (s)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='zth-time-slider8',
-                    min=-6,  # 例如對數刻度
-                    max=1,   # 依實際數據
-                    step=1,
-                    marks={i: f"1e{i}" for i in range(-6, 2)},
-                    value=[-6, 1],
-                    allowCross=False,
-                    className='zth-time-slider'
-                ),
-                html.Div(id='zth-time-output8',
-                         style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-
-            # 數據表格
-            dash_table.DataTable(
-                id='zth-table8',
-                style_table={'overflowX': 'auto'},
-                page_size=15,
-                filter_action='native',
-                style_data_conditional=style_data_conditional,
-                # 欄位會在回調裡動態生成
-                columns=[],
-                data=[],
-                style_cell={
-                    'fontFamily': 'Arial, sans-serif',
-                    'fontSize': 16,
-                    'textAlign': 'center',
-                    'padding': '5px'
-                }
-            ),
-
-            # 如需 Tabs 區塊
-            html.Hr(style={'margin': '20px 0'}),
-            html.H5("相關分析", className="card-title"),
-            dcc.Tabs(id='zth-additional-tabs', value='tab-1', children=[
-                dcc.Tab(label='Tab 1', value='tab-1', children=[
-                    html.Div([
-                        html.P("這是 Zth Analysis 的頁籤一。"),
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 2', value='tab-2', children=[
-                    html.Div([
-                        html.P("這是 Zth Analysis 的頁籤二。"),
-                    ], style={'padding': '20px'})
-                ]),
-            ])
-        ]),
-        className="shadow-sm border mb-4",
-        style={'padding': '10px'}
-    )
-
-
-
-
-
-
-#Card_7
-def create_loss_analysis_card7():
-    # 讀取並處理數據
-    df = load_data(DATA_FILE_PATH7)
-    if df.empty:
-        print("DataFrame is empty in create_loss_analysis_card7.")  # 調試輸出
-
-    # 定義需要標記的條件
-    highlight_conditions = [
-        {'溫度': 'If25℃', 'IC (A)': 447.51},
-        {'溫度': 'Vf25℃', 'IC (A)': 819.11},
-        {'溫度': 'If150℃', 'IC (A)': 451.644},
-        {'溫度': 'Vf150℃', 'IC (A)': 823.824},
-        {'溫度': 'If175℃', 'IC (A)': 450.026},
-        {'溫度': 'Vf175℃', 'IC (A)': 824.324},
-    ]
-
-    # 生成 style_data_conditional
-    style_data_conditional = [
-        {
-            'if': {
-                'filter_query': f'{{溫度}} = "{cond["溫度"]}" && {{IC (A)}} = {cond["IC (A)"]}',
-            },
-            'backgroundColor': 'lightblue',
-            'color': 'black'
-        }
-        for cond in highlight_conditions
-    ]
-
-    return dbc.Card(
-        dbc.CardBody([
-            html.H5("Characteristics Diagrams", className="card-title"),
-            html.H5("IGBT Total gate charge characteristic ", style={'textAlign': 'left', 'marginBottom': '16px'}),
-
-            # Radio 按鈕置中，並應用自定義 CSS 類
-            dbc.Row([
-                dbc.Col(
-                    dbc.RadioItems(
-                        options=[
-                            {'label': 'VCE = 400V, IC = 450A, Tj = 25°C, VGE = f(QG)', 'value': 'GATECHARGEL'}
-                        ],
-                        value='GATECHARGEL',  # 默認選擇
-                        id='gatechargel6',
-                        inline=True,
-                        className='custom-radio'  # 添加自定義 CSS 類名
-                    ),
-                    width=12,
-                    className='fixed-radio-container'  # 添加固定高度的容器類名
-                )
-            ], className="mb-3"),
-
-            # 圖片顯示
-            html.Div(
-                children=[
-                    html.Img(
-                        id='icvce-image7',
-                        src='/assets/GATECHARGEL.png',  # 默認圖片
-                        style={'width': '70%', 'height': 'auto'}
-                    ),
-                ],
-                style={
-                    'padding': '20px',
-                    'textAlign': 'center'
-                }
-            ),
-
-            # 標題顯示在圖片下方
-            html.Div(id='icvce-title7', style={'textAlign': 'center', 'fontSize': '20px', 'marginTop': '10px'}),
-
-            # 溫度選擇與範圍滑桿
-            html.Div([
-                html.Label("選擇溫度 (圖表)", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-graph7',
-                    options=[
-                       # {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                       # {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},
-                       # {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'},
-                       {'label': 'Tj = 25℃', 'value': 'ifvf_all_temperatures'}  # 將「所有溫度」設為選項
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 VGE 範圍 (V)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_ic-range-slider7',
-                    min=-8,  # 修改為 -100
-                    max=30,  # 假設最大IC值為1800A
-                    step=5,  # 設置步長為10A
-                    marks={i: str(i) for i in range(-8, 30, 5)},
-                    value=[-8, 30],
-                    allowCross=False,
-                    className='ic-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_ic-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 QG 範圍 (μC)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_vce-range-slider7',
-                    min=0,  # 修改為 -1
-                    max=3,  # 調整為15V
-                    step=1,  # 設置步長為1V
-                    marks={i: str(i) for i in range(0,3,1)},  # 標記從-1到15
-                    value=[0, 3],  # 默認值為-1到15V
-                    allowCross=False,
-                    className='vce-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_vce-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            # 損耗分析圖表
-            dcc.Graph(id='loss_loss-graph7', style={'margin-bottom': '50px'},
-                      config={'displayModeBar': False,  # 顯示工具列
-                                'displaylogo': False     # 是否隱藏 Plotly 的 logo
-                              }),  # 損耗分析圖表
-            # 溫度選擇表格
-            html.Div([
-                html.Label("選擇溫度", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-table7',
-                    options=[
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'},  # 將「所有溫度」設為選項
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},  # 修正50℃為150℃
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'}
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            # 損耗分析表格
-            dash_table.DataTable(
-                id='loss_loss-table7',
-                style_table={'overflowX': 'auto'},
-                page_size=30,
-                filter_action='native',  # 啟用過濾功能
-                columns=[  # 預設欄位，稍後動態更新
-                    {"name": "Index", "id": "編號"},
-                    {"name": "Temperature (°C)", "id": "溫度"},
-                    {"name": "QG (μC)", "id": "QG (μC)"},
-                    {"name": "VGE (V)", "id": "VGE (V)"}  # 新增的欄位
-
-                ],
-                style_cell={
-                    'fontFamily': 'Arial, sans-serif',  # 與其他字體一致
-                    'fontSize': 17,  # 字體大小
-                    'textAlign': 'center',  # 預設文本對齊方式
-                    'padding': '5px'  # 單元格內邊距
-                },
-                style_data_conditional=style_data_conditional
-            ),
-            # Card7_新增 Tabs 區塊
-            html.Hr(style={'margin': '20px 0'}),
-            html.H5("相關分析", className="card-title"),
-            dcc.Tabs(id='additional-tabs', value='tab-1', children=[
-                dcc.Tab(label='Tab 1', value='tab-1', children=[
-                    html.Div([
-                        html.P("這是頁籤一的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 2', value='tab-2', children=[
-                    html.Div([
-                        html.P("這是頁籤二的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 3', value='tab-3', children=[
-                    html.Div([
-                        html.P("這是頁籤三的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 4', value='tab-4', children=[
-                    html.Div([
-                        html.P("這是頁籤四的內容。"),
-                        dbc.Button("存檔", id='save-tab4', color="success"),
-                        dcc.Download(id="download-tab4")
-                    ], style={'padding': '20px'})
-                ]),
-            ])
-        ]),
-        className="shadow-sm border mb-4",
-        style={'padding': '10px'}
-    )
-
-
-
-
-#++++
-#Card_6
-def create_loss_analysis_card6():
-    # 讀取並處理數據
-    df = load_data(DATA_FILE_PATH6)
-    if df.empty:
-        print("DataFrame is empty in create_loss_analysis_card6.")  # 調試輸出
-
-    # 定義需要標記的條件
-    highlight_conditions = [
-        {'溫度': 'If25℃', 'IC (A)': 447.51},
-        {'溫度': 'Vf25℃', 'IC (A)': 819.11},
-        {'溫度': 'If150℃', 'IC (A)': 451.644},
-        {'溫度': 'Vf150℃', 'IC (A)': 823.824},
-        {'溫度': 'If175℃', 'IC (A)': 450.026},
-        {'溫度': 'Vf175℃', 'IC (A)': 824.324},
-    ]
-
-    # 生成 style_data_conditional
-    style_data_conditional = [
-        {
-            'if': {
-                'filter_query': f'{{溫度}} = "{cond["溫度"]}" && {{IC (A)}} = {cond["IC (A)"]}',
-            },
-            'backgroundColor': 'lightblue',
-            'color': 'black'
-        }
-        for cond in highlight_conditions
-    ]
-
-    return dbc.Card(
-        dbc.CardBody([
-            html.H5("Characteristics Diagrams", className="card-title"),
-            html.H5("Diode, Switching losses vs. RG ", style={'textAlign': 'left', 'marginBottom': '16px'}),
-
-            # Radio 按鈕置中，並應用自定義 CSS 類
-            dbc.Row([
-                dbc.Col(
-                    dbc.RadioItems(
-                        options=[
-                            {'label': 'IF = 450A, VR = 400V, Erec = f(RG)', 'value': 'ERECRGH'}
-                        ],
-                        value='ERECRGH',  # 默認選擇
-                        id='erecrg-radio5',
-                        inline=True,
-                        className='custom-radio'  # 添加自定義 CSS 類名
-                    ),
-                    width=12,
-                    className='fixed-radio-container'  # 添加固定高度的容器類名
-                )
-            ], className="mb-3"),
-
-            # 圖片顯示
-            html.Div(
-                children=[
-                    html.Img(
-                        id='icvce-image6',
-                        src='/assets/ERECRGH.png',  # 默認圖片
-                        style={'width': '70%', 'height': 'auto', 'border': '1px solid lightgray'}
-                    ),
-                ],
-                style={
-                    'padding': '20px',
-                    'textAlign': 'center'
-                }
-            ),
-
-            # 標題顯示在圖片下方
-            html.Div(id='icvce-title6', style={'textAlign': 'center', 'fontSize': '20px', 'marginTop': '10px'}),
-
-            # 溫度選擇與範圍滑桿
-            html.Div([
-                html.Label("選擇溫度 (圖表)", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-graph6',
-                    options=[
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'},
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'}  # 將「所有溫度」設為選項
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 RG 範圍 (Ω)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_ic-range-slider6',
-                    min=0,  # 修改為 -100
-                    max=30,  # 假設最大IC值為1800A
-                    step=5,  # 設置步長為10A
-                    marks={i: str(i) for i in range(0, 30, 5)},
-                    value=[0, 30],
-                    allowCross=False,
-                    className='ic-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_ic-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 EREC 範圍 (MJ)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_vce-range-slider6',
-                    min=0,  # 修改為 -1
-                    max=20,  # 調整為15V
-                    step=5,  # 設置步長為1V
-                    marks={i: str(i) for i in range(0, 20,5)},  # 標記從-1到15
-                    value=[0, 20],  # 默認值為-1到15V
-                    allowCross=False,
-                    className='vce-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_vce-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            # 損耗分析圖表
-            dcc.Graph(id='loss_loss-graph6', style={'margin-bottom': '50px'},
-            config={'displayModeBar': False,  # 顯示工具列
-                    'displaylogo': False  # 是否隱藏 Plotly 的 logo
-                    }
-    ),  # 損耗分析圖表
-            # 溫度選擇表格
-            html.Div([
-                html.Label("選擇溫度", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-table6',
-                    options=[
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'},  # 將「所有溫度」設為選項
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},  # 修正50℃為150℃
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'}
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            # 損耗分析表格
-            dash_table.DataTable(
-                id='loss_loss-table6',
-                style_table={'overflowX': 'auto'},
-                page_size=30,
-                filter_action='native',  # 啟用過濾功能
-                columns=[  # 預設欄位，稍後動態更新
-                    {"name": "Index", "id": "編號"},
-                    {"name": "Temperature (°C)", "id": "溫度"},
-                    {"name": "RG (Ω)", "id": "RG (Ω)"},
-                    {"name": "EREC (mJ)", "id": "EREC (mJ)"}  # 新增的欄位
-
-                ],
-                style_cell={
-                    'fontFamily': 'Arial, sans-serif',  # 與其他字體一致
-                    'fontSize': 17,  # 字體大小
-                    'textAlign': 'center',  # 預設文本對齊方式
-                    'padding': '5px'  # 單元格內邊距
-                },
-                style_data_conditional=style_data_conditional
-            ),
-            # Card6_新增 Tabs 區塊
-            html.Hr(style={'margin': '20px 0'}),
-            html.H5("相關分析", className="card-title"),
-            dcc.Tabs(id='additional-tabs', value='tab-1', children=[
-                dcc.Tab(label='Tab 1', value='tab-1', children=[
-                    html.Div([
-                        html.P("這是頁籤一的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 2', value='tab-2', children=[
-                    html.Div([
-                        html.P("這是頁籤二的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 3', value='tab-3', children=[
-                    html.Div([
-                        html.P("這是頁籤三的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 4', value='tab-4', children=[
-                    html.Div([
-                        html.P("這是頁籤四的內容。"),
-                        dbc.Button("存檔", id='save-tab4', color="success"),
-                        dcc.Download(id="download-tab4")
-                    ], style={'padding': '20px'})
-                ]),
-            ])
-        ]),
-        className="shadow-sm border mb-4",
-        style={'padding': '10px'}
-    )
-
-
-
-
-#++++
-#Card_5
-def create_loss_analysis_card5():
-    # 讀取並處理數據
-    df = load_data(DATA_FILE_PATH5)
-    if df.empty:
-        print("DataFrame is empty in create_loss_analysis_card5.")  # 調試輸出
-
-    # 定義需要標記的條件
-    highlight_conditions = [
-        {'溫度': 'If25℃', 'IC (A)': 447.51},
-        {'溫度': 'Vf25℃', 'IC (A)': 819.11},
-        {'溫度': 'If150℃', 'IC (A)': 451.644},
-        {'溫度': 'Vf150℃', 'IC (A)': 823.824},
-        {'溫度': 'If175℃', 'IC (A)': 450.026},
-        {'溫度': 'Vf175℃', 'IC (A)': 824.324},
-    ]
-
-    # 生成 style_data_conditional
-    style_data_conditional = [
-        {
-            'if': {
-                'filter_query': f'{{溫度}} = "{cond["溫度"]}" && {{IC (A)}} = {cond["IC (A)"]}',
-            },
-            'backgroundColor': 'lightblue',
-            'color': 'black'
-        }
-        for cond in highlight_conditions
-    ]
-
-    return dbc.Card(
-        dbc.CardBody([
-            html.H5("Characteristics Diagrams", className="card-title"),
-            html.H5("Eon, Eoff(Rg) Curve ", style={'textAlign': 'left', 'marginBottom': '16px'}),
-
-            # Radio 按鈕置中，並應用自定義 CSS 類
-            dbc.Row([
-                dbc.Col(
-                    dbc.RadioItems(
-                        options=[
-                            {'label': 'Eon, Eoff = f(Rg)', 'value': 'EONEOFFRG'}
-                        ],
-                        value='EONEOFFRG',  # 默認選擇
-                        id='eoneoffrg-radio5',
-                        inline=True,
-                        className='custom-radio'  # 添加自定義 CSS 類名
-                    ),
-                    width=12,
-                    className='fixed-radio-container'  # 添加固定高度的容器類名
-                )
-            ], className="mb-3"),
-
-            # 圖片顯示
-            html.Div(
-                children=[
-                    html.Img(
-                        id='icvce-image5',
-                        src='/assets/EONEOFFRGF.png',  # 默認圖片
-                        style={'width': '70%', 'height': 'auto', 'border': '1px solid lightgray'}
-                    ),
-                ],
-                style={
-                    'padding': '20px',
-                    'textAlign': 'center'
-                }
-            ),
-
-            # 標題顯示在圖片下方
-            html.Div(id='icvce-title5', style={'textAlign': 'center', 'fontSize': '20px', 'marginTop': '10px'}),
-
-            # 溫度選擇與範圍滑桿
-            html.Div([
-                html.Label("選擇溫度 (圖表)", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-graph5',
-                    options=[
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'},
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'}  # 將「所有溫度」設為選項
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 Eon, Eoff 範圍 (mJ)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_ic-range-slider5',
-                    min=0,  # 修改為 -100
-                    max=100,  # 假設最大IC值為1800A
-                    step=10,  # 設置步長為10A
-                    marks={i: str(i) for i in range(0, 100, 10)},
-                    value=[0, 100],
-                    allowCross=False,
-                    className='ic-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_ic-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 IC 範圍 (A)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_vce-range-slider5',
-                    min=0,  # 修改為 -1
-                    max=100,  # 調整為15V
-                    step=10,  # 設置步長為1V
-                    marks={i: str(i) for i in range(0, 100,10)},  # 標記從-1到15
-                    value=[0, 100],  # 默認值為-1到15V
-                    allowCross=False,
-                    className='vce-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_vce-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            # 損耗分析圖表
-            dcc.Graph(id='loss_loss-graph5', style={'margin-bottom': '50px'},
-                      config={'displayModeBar': False,  # 顯示工具列
-                              'displaylogo': False  # 是否隱藏 Plotly 的 logo
-                              }
-                      ),  # 損耗分析圖表
-            # 溫度選擇表格
-            html.Div([
-                html.Label("選擇溫度", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-table5',
-                    options=[
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'},  # 將「所有溫度」設為選項
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},  # 修正50℃為150℃
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'}
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            # 損耗分析表格
-            dash_table.DataTable(
-                id='loss_loss-table5',
-                style_table={'overflowX': 'auto'},
-                page_size=30,
-                filter_action='native',  # 啟用過濾功能
-                columns=[  # 預設欄位，稍後動態更新
-                    {"name": "Index", "id": "編號"},
-                    {"name": "Temperature (°C)", "id": "溫度"},
-                    {"name": "IC (A)", "id": "IC (A)"},
-                    {"name": "VCE (V)", "id": "VCE (V)"},
-                    {"name": "VCE2 (V)", "id": "VCE2 (V)"}  # 新增的欄位
-                ],
-                style_cell={
-                    'fontFamily': 'Arial, sans-serif',  # 與其他字體一致
-                    'fontSize': 17,  # 字體大小
-                    'textAlign': 'center',  # 預設文本對齊方式
-                    'padding': '5px'  # 單元格內邊距
-                },
-                style_data_conditional=style_data_conditional
-            ),
-            # Card5_新增 Tabs 區塊
-            html.Hr(style={'margin': '20px 0'}),
-            html.H5("相關分析", className="card-title"),
-            dcc.Tabs(id='additional-tabs', value='tab-1', children=[
-                dcc.Tab(label='Tab 1', value='tab-1', children=[
-                    html.Div([
-                        html.P("這是頁籤一的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 2', value='tab-2', children=[
-                    html.Div([
-                        html.P("這是頁籤二的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 3', value='tab-3', children=[
-                    html.Div([
-                        html.P("這是頁籤三的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 4', value='tab-4', children=[
-                    html.Div([
-                        html.P("這是頁籤四的內容。"),
-                        dbc.Button("存檔", id='save-tab4', color="success"),
-                        dcc.Download(id="download-tab4")
-                    ], style={'padding': '20px'})
-                ]),
-            ])
-        ]),
-        className="shadow-sm border mb-4",
-        style={'padding': '10px'}
-    )
-
-
-
-
-
-
-#Card_4
-def create_loss_analysis_card4():
-    # 讀取並處理數據
-    df = load_data(DATA_FILE_PATH4)
-    if df.empty:
-        print("DataFrame is empty in create_loss_analysis_card4.")  # 調試輸出
-
-    # 定義需要標記的條件
-    highlight_conditions = [
-        {'溫度': 'If25℃', 'IC (A)': 447.51},
-        {'溫度': 'Vf25℃', 'IC (A)': 819.11},
-        {'溫度': 'If150℃', 'IC (A)': 451.644},
-        {'溫度': 'Vf150℃', 'IC (A)': 823.824},
-        {'溫度': 'If175℃', 'IC (A)': 450.026},
-        {'溫度': 'Vf175℃', 'IC (A)': 824.324},
-    ]
-
-    # 生成 style_data_conditional
-    style_data_conditional = [
-        {
-            'if': {
-                'filter_query': f'{{溫度}} = "{cond["溫度"]}" && {{IC (A)}} = {cond["IC (A)"]}',
-            },
-            'backgroundColor': 'lightblue',
-            'color': 'black'
-        }
-        for cond in highlight_conditions
-    ]
-
-    return dbc.Card(
-        dbc.CardBody([
-            html.H5("Characteristics Diagrams", className="card-title"),
-            html.H5("Eon, Eoff(IC) Curve ", style={'textAlign': 'left', 'marginBottom': '16px'}),
-
-            # Radio 按鈕置中，並應用自定義 CSS 類
-            dbc.Row([
-                dbc.Col(
-                    dbc.RadioItems(
-                        options=[
-                            {'label': 'Eon, Eoff = f(Ic)', 'value': 'EONEOFFIC'}
-                        ],
-                        value='EONEOFFIC',  # 默認選擇
-                        id='eoneoffic-radio4',
-                        inline=True,
-                        className='custom-radio'  # 添加自定義 CSS 類名
-                    ),
-                    width=12,
-                    className='fixed-radio-container'  # 添加固定高度的容器類名
-                )
-            ], className="mb-3"),
-
-            # 圖片顯示
-            html.Div(
-                children=[
-                    html.Img(
-                        id='icvce-image4',
-                        src='/assets/EONEOFFICE.png',  # 默認圖片
-                        style={'width': '70%', 'height': 'auto'}
-                    ),
-                ],
-                style={
-                    'padding': '20px',
-                    'textAlign': 'center'
-                }
-            ),
-
-            # 標題顯示在圖片下方
-            html.Div(id='icvce-title4', style={'textAlign': 'center', 'fontSize': '20px', 'marginTop': '10px'}),
-
-            # 溫度選擇與範圍滑桿
-            html.Div([
-                html.Label("選擇溫度 (圖表)", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-graph4',
-                    options=[
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'},
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'}  # 將「所有溫度」設為選項
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 Eon, Eoff 範圍 (mJ)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_ic-range-slider4',
-                    min=-100,  # 修改為 -100
-                    max=1800,  # 假設最大IC值為1800A
-                    step=10,  # 設置步長為10A
-                    marks={i: str(i) for i in range(0, 1801, 100)},
-                    value=[0, 1800],
-                    allowCross=False,
-                    className='ic-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_ic-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 IC 範圍 (A)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_vce-range-slider4',
-                    min=0,  # 修改為 -1
-                    max=140,  # 調整為15V
-                    step=10,  # 設置步長為1V
-                    marks={i: str(i) for i in range(0, 140,20)},  # 標記從-1到15
-                    value=[0, 140],  # 默認值為-1到15V
-                    allowCross=False,
-                    className='vce-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_vce-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            # 損耗分析圖表
-            dcc.Graph(id='loss_loss-graph4', style={'margin-bottom': '50px'},
-                      config={'displayModeBar': False,  # 顯示工具列
-                              'displaylogo': False  # 是否隱藏 Plotly 的 logo
-                              }
-                      ),  # 損耗分析圖表
-            # 溫度選擇表格
-            html.Div([
-                html.Label("選擇溫度", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-table4',
-                    options=[
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'},  # 將「所有溫度」設為選項
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},  # 修正50℃為150℃
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'}
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            # 損耗分析表格
-            dash_table.DataTable(
-                id='loss_loss-table4',
-                style_table={'overflowX': 'auto'},
-                page_size=30,
-                filter_action='native',  # 啟用過濾功能
-                columns=[  # 預設欄位，稍後動態更新
-                    {"name": "Index", "id": "編號"},
-                    {"name": "Temperature (°C)", "id": "溫度"},
-                    {"name": "IC (A)", "id": "IC (A)"},
-                    {"name": "VCE (V)", "id": "VCE (V)"},
-                    {"name": "VCE2 (V)", "id": "VCE2 (V)"}  # 新增的欄位
-                ],
-                style_cell={
-                    'fontFamily': 'Arial, sans-serif',  # 與其他字體一致
-                    'fontSize': 17,  # 字體大小
-                    'textAlign': 'center',  # 預設文本對齊方式
-                    'padding': '5px'  # 單元格內邊距
-                },
-                style_data_conditional=style_data_conditional
-            ),
-            # Card4_新增 Tabs 區塊
-            html.Hr(style={'margin': '20px 0'}),
-            html.H5("相關分析", className="card-title"),
-            dcc.Tabs(id='additional-tabs', value='tab-1', children=[
-                dcc.Tab(label='Tab 1', value='tab-1', children=[
-                    html.Div([
-                        html.P("這是頁籤一的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 2', value='tab-2', children=[
-                    html.Div([
-                        html.P("這是頁籤二的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 3', value='tab-3', children=[
-                    html.Div([
-                        html.P("這是頁籤三的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 4', value='tab-4', children=[
-                    html.Div([
-                        html.P("這是頁籤四的內容。"),
-                        dbc.Button("存檔", id='save-tab4', color="success"),
-                        dcc.Download(id="download-tab4")
-                    ], style={'padding': '20px'})
-                ]),
-            ])
-        ]),
-        className="shadow-sm border mb-4",
-        style={'padding': '10px'}
-    )
-
-def create_loss_analysis_card3():
-    # 讀取並處理數據
-    df = load_data(DATA_FILE_PATH3)
-    if df.empty:
-        print("DataFrame is empty in create_loss_analysis_card3.")  # 調試輸出
-
-    # 定義需要標記的條件
-    highlight_conditions = [
-        {'溫度': 'If25℃', 'IC (A)': 447.51},
-        {'溫度': 'Vf25℃', 'IC (A)': 819.11},
-        {'溫度': 'If150℃', 'IC (A)': 451.644},
-        {'溫度': 'Vf150℃', 'IC (A)': 823.824},
-        {'溫度': 'If175℃', 'IC (A)': 450.026},
-        {'溫度': 'Vf175℃', 'IC (A)': 824.324},
-    ]
-
-    # 生成 style_data_conditional
-    style_data_conditional = [
-        {
-            'if': {
-                'filter_query': f'{{溫度}} = "{cond["溫度"]}" && {{IC (A)}} = {cond["IC (A)"]}',
-            },
-            'backgroundColor': 'lightblue',
-            'color': 'black'
-        }
-        for cond in highlight_conditions
-    ]
-
-    return dbc.Card(
-        dbc.CardBody([
-            html.H5("Characteristics Diagrams", className="card-title"),
-            html.H5("IF, VF Curve", style={'textAlign': 'left', 'marginBottom': '16px'}),
-
-            # Radio 按鈕置中，並應用自定義 CSS 類
-            dbc.Row([
-                dbc.Col(
-                    dbc.RadioItems(
-                        options=[
-                            {'label': 'If = f(VF)', 'value': 'VGE_15V_IC_f_VCE'}
-                        ],
-                        value='VGE_15V_IC_f_VCE',  # 默認選擇
-                        id='icvce-radio3',
-                        inline=True,
-                        className='custom-radio'  # 添加自定義 CSS 類名
-                    ),
-                    width=12,
-                    className='fixed-radio-container'  # 添加固定高度的容器類名
-                )
-            ], className="mb-3"),
-
-            # 圖片顯示
-            html.Div(
-                children=[
-                    html.Img(
-                        id='icvce-image3',
-                        src='/assets/IFVFD.png',  # 默認圖片
-                        style={'width': '70%', 'height': 'auto', 'border': '1px solid lightgray'}
-                    ),
-                ],
-                style={
-                    'padding': '20px',
-                    'textAlign': 'center'
-                }
-            ),
-
-            # 標題顯示在圖片下方
-            html.Div(id='icvce-title3', style={'textAlign': 'center', 'fontSize': '20px', 'marginTop': '10px'}),
-
-            # 溫度選擇與範圍滑桿
-            html.Div([
-                html.Label("選擇溫度 (圖表)", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-graph3',
-                    options=[
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'},
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'}  # 將「所有溫度」設為選項
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 IF 範圍 (A)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_ic-range-slider3',
-                    min=-100,  # 修改為 -100
-                    max=1800,  # 假設最大IC值為1800A
-                    step=10,  # 設置步長為10A
-                    marks={i: str(i) for i in range(0, 1801, 100)},
-                    value=[0, 1800],
-                    allowCross=False,
-                    className='ic-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_ic-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 VF 範圍 (V)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_vce-range-slider3',
-                    min=-1,  # 修改為 -1
-                    max=4,  # 調整為4V
-                    step=0.1,  # 設置步長為0.1V
-                    marks={i: str(i) for i in range(-1, 5)},  # 標記從-1到4
-                    value=[-1, 4],  # 默認值為-1到4V
-                    allowCross=False,
-                    className='vce-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_vce-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            # 損耗分析圖表
-            dcc.Graph(id='loss_loss-graph3', style={'margin-bottom': '50px'},
-                      config={'displayModeBar': False,  # 顯示工具列
-                              'displaylogo': False  # 是否隱藏 Plotly 的 logo
-                              }
-                      ),  # 損耗分析圖表
-            # 溫度選擇表格
-            html.Div([
-                html.Label("選擇溫度", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-table3',
-                    options=[
-                        {'label': '所有溫度', 'value': 'ifvf_all_temperatures'},  # 將「所有溫度」設為選項
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 50℃', 'value': 'Tj_150C_IC_f_VCE'},
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'}
-                    ],
-                    value='ifvf_all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            # 損耗分析表格
-            dash_table.DataTable(
-                id='loss_loss-table3',
-                style_table={'overflowX': 'auto'},
-                page_size=30,
-                filter_action='native',  # 啟用過濾功能
-                columns=[  # 預設欄位，稍後動態更新
-                    {"name": "Index", "id": "編號"},
-                    {"name": "Temperature (°C)", "id": "溫度"},
-                    {"name": "IC (A)", "id": "IC (A)"},
-                    {"name": "VCE (V)", "id": "VCE (V)"}
-                ],
-                style_cell={
-                    'fontFamily': 'Arial, sans-serif',  # 與其他字體一致
-                    'fontSize': 17,  # 字體大小
-                    'textAlign': 'center',  # 預設文本對齊方式
-                    'padding': '5px'  # 單元格內邊距
-                },
-                style_data_conditional=style_data_conditional
-            ),
-            # Card3_新增 Tabs 區塊
-            html.Hr(style={'margin': '20px 0'}),
-            html.H5("相關分析", className="card-title"),
-            dcc.Tabs(id='additional-tabs', value='tab-1', children=[
-                dcc.Tab(label='Tab 1', value='tab-1', children=[
-                    html.Div([
-                        # 新增圖像區塊
-                        html.Div(
-                            children=[
-                                html.Img(
-                                    src=f'data:image/png;base64,{encoded_image}',
-                                    className='zoomable',  # 添加放大鏡CSS類
-                                    style={'width': '100%', 'height': 'auto'}  # 調整寬度為100%
-                                ),
-                            ],
-                            style={
-                                'padding': '20px',
-                                'textAlign': 'center'
-                            }
-                        ),
-
-                        # 新增文本區塊
-                        html.Div(
-                            style={
-                                'flex': '1',
-                                'minWidth': '380px'
-                            },
-                            children=[
-                                # 定義主標題
-                                html.H3(
-                                    children=['不同溫度下 IF與VF 關係'],
-                                    style={
-                                        'margin-bottom': '10px',
-                                        'color': '#003366',  # 深藍色
-                                        'margin-top': '0px',
-                                        'font-size': '26px',  # 調整字體大小
-                                        'font-weight': 'bold'  # 加粗
-                                    }
-                                ),
-                                # 定義段落並允許斷行
-                                html.P(
-                                    children=[
-                                        "不同溫度的數據（25℃、150℃、175℃）顯示了 VF 與 IF 的非線性關係。"
-                                    ],
-                                    style={
-                                        'white-space': 'pre-line',  # 允許斷行
-                                        'color': '#333333',  # 深灰色
-                                        'margin-top': '10px',
-                                        'margin-bottom': '20px',
-                                        'font-size': '18px'  # 調整字體大小
-                                    }
-                                ),
-
-                                # 擬合曲線的準確性
-                                html.H3(
-                                    children=['擬合曲線的準確性'],
-                                    style={'font-size': '20px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.Details([
-                                    html.Summary(
-                                        '數據匯入',
-                                        style={
-                                            'font-size': '18px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                        **從表格中提取 VF 和 IF 的數據**，根據不同溫度（25°C、150°C、175°C）分別建立數據集。這些數據會用於擬合三次多項式模型。
-
-                        **數學表示**
-
-                        模型為：
-
-                        $$
-                        IF = a \cdot VF^3 + b \cdot VF^2 + c \cdot VF + d
-                        $$
-
-                        其中：
-                        - **VF**：順向電壓（自變量）。
-                        - **IF**：順向電流（因變量）。
-                        ''', mathjax=True)
-                                ]),
-                                html.Details([
-                                    html.Summary(
-                                        '數據處理：擬合方法',
-                                        style={
-                                            'font-size': '18px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                        **擬合的數學過程**：
-
-                        **目標**：找到一組最佳係數 \(a, b, c, d\)，使得三次多項式
-
-                        $$
-                        IF = a \cdot VF^3 + b \cdot VF^2 + c \cdot VF + d
-                        $$
-
-                        的曲線盡可能貼合測量數據。
-
-                        **使用方法**：常見的方法是**最小二乘法**，它通過最小化以下誤差函數來找到最佳係數：
-
-                        $$
-                        \text{誤差} = \sum_{i=1}^{n} \left(IF_{\text{實測},i} - IF_{\text{預測},i}\right)^2
-                        $$
-
-                        其中：
-                        $$
-                        - IF_{\text{實測},i} ：第 i 個數據點的實測電流值。
-                        $$
-                        $$
-                        - F_{\text{預測},i} ：第 i 個數據點的模型預測值。
-                        $$
-                        $$
-                        - n：數據點總數。
-                        $$
-
-                        **工具**：
-                        - 使用程式（如 Python 的 `curve_fit`）來執行上述計算。
-                        ''', mathjax=True)
-                                ]),
-
-                                # 多溫度數據擬合
-                                html.Details([
-                                    html.Summary(
-                                        '多溫度數據擬合',
-                                        style={
-                                            'font-size': '18px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                        對**不同溫度下**的數據進行擬合，計算出係數 \(a, b, c, d\)。這些係數後可將它們帶入公式，對任意 **VF** 計算 **IF**：
-
-                        $$
-                        IF = a \cdot VF^3 + b \cdot VF^2 + c \cdot VF + d
-                        $$
-                        ''', mathjax=True)
-                                ]),
-
-                                # 評估指標的解釋
-                                html.H3(
-                                    children=['評估指標的解釋'],
-                                    style={'font-size': '20px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.Details([
-                                    html.Summary(
-                                        'R²（決定係數）',
-                                        style={
-                                            'font-size': '18px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                        **R²（決定係數）** 用來衡量擬合模型解釋數據變異的能力。值域為：
-
-                        $$
-                        0 \leq R² \leq 1
-                        $$
-
-                        - **\( R² = 1 \)**：表示模型完美擬合數據，所有數據點都在模型曲線上。
-                        - **\( R² \) 越接近 1**：表示模型對數據的擬合越好，能解釋更多的變異。
-                        - **\( R² \) 接近 0**：表示模型無法有效解釋數據的變異，擬合效果較差。
-
-                        **計算公式**：
-
-                        $$
-                        R² = 1 - \frac{\text{SS}_{res}}{\text{SS}_{tot}}
-                        $$
-
-                        其中：
-                        $$
-                        {SS}_{res}：殘差平方和（Residual Sum of Squares）。
-                        $$
-                        $$
-                        {SS}_{tot}：總變異平方和（Total Sum of Squares）。
-                        $$
-
-                        **如何解讀**：
-                        - **\( R² = 1 \)**：模型完美擬合數據。
-                        - **\( R² = 0 \)**：模型無法解釋任何變異。
-                        - **\( R² \) 接近 1**，但仍有較高的 MSE 或 MAE，可能表示數據內部存在離群點。
-                        ''', mathjax=True)
-                                ]),
-                                html.Details([
-                                    html.Summary(
-                                        'MSE（均方誤差）',
-                                        style={
-                                            'font-size': '18px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                        **MSE（均方誤差Mean Squared Error）** 是衡量模型預測值與真實值之間差距的平均平方誤差。
-
-                        **計算公式**：
-
-                        $$
-                        \text{MSE} = \frac{1}{n} \sum_{i=1}^n (y_i - \hat{y}_i)^2
-                        $$
-
-                        其中：
-                        $$
-                        y_i：真實值。
-                        $$
-                        $$
-                        \hat{y}_i：模型預測值。
-                        $$
-                        $$
-                        n：數據點總數。
-                        $$
-
-                        **如何解讀**：
-                        - **MSE 越小**：表示模型預測的精確性越高。
-                        - **單位**：與目標變數（如 IF）的平方單位一致，因此對於單位較大的數據，MSE 數值也會較大。
-                        - **優點**：適合用來檢查模型對數據整體的擬合精度。
-                        - **缺點**：容易受到離群點的影響。
-                        ''', mathjax=True)
-                                ]),
-                                html.Details([
-                                    html.Summary(
-                                        'MAE（平均絕對誤差）',
-                                        style={
-                                            'font-size': '18px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                        **MAE（平均絕對誤差Mean Absolute Error）** 是衡量模型預測值與真實值之間差距的平均絕對誤差。
-
-                        **計算公式**：
-
-                        $$
-                        \text{MAE} = \frac{1}{n} \sum_{i=1}^n |y_i - \hat{y}_i|
-                        $$
-
-                        其中：
-                        $$
-                        y_i：真實值。
-                        $$
-                        $$
-                        \hat{y}_i：模型預測值。
-                        $$
-                        $$
-                        n：數據點總數。
-                        $$
-
-                        **如何解讀**：
-                        - **MAE 越小**：表示模型對數據的擬合越準確。
-                        - **單位**：具有直觀的物理單位（如 IF 單位為安培）。
-                        - **優點**：對於離群點的影響較小，因此適合用於評估模型的穩定性。
-                        ''', mathjax=True)
-                                ]),
-
-                                # 斜率的計算
-                                html.H3(
-                                    children=['斜率的計算'],
-                                    style={'font-size': '20px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.P(
-                                    children=[
-                                        "在不同溫度下，擬合曲線的斜率反映了VF與IF之間的變化率。",
-                                        html.Br(),
-                                        "例如，在VF=0時和VF=627時的斜率分別計算如下：",
-                                        html.Br(),
-                                        r"斜率 (VF=0): 由擬合函數的一次項係數 \(c\) 決定。",
-                                        html.Br(),
-                                        "斜率 (VF=627): 由擬合函數的一階導數計算得到，公式如下：",
-                                        html.Br(),
-                                        dcc.Markdown(r'''
-                        $$
-                        m = 3aVf^2 + 2bVf + c
-                        $$
-
-                        其中，\(a\), \(b\), \(c\) 是擬合參數。
-                        ''', mathjax=True)
-                                    ],
-                                    style={'font-size': '18px', 'color': '#333333'}
-                                ),
-
-                                # 擬合參數與指標說明
-                                html.H3(
-                                    children=['擬合參數與指標'],
-                                    style={'font-size': '20px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.P(
-                                    children=[
-                                        "每條擬合曲線旁邊標註了擬合方程式及其指標：",
-                                        html.Br(),
-                                        r"- **擬合方程式**：\( y = ax^3 + bx^2 + cx + d \)",
-                                        html.Br(),
-                                        "- **R²**：決定係數，用於衡量擬合的準確性。值越接近1表示擬合效果越好。",
-                                        "- **MSE**：均方誤差，反映擬合誤差的平均水平。",
-                                        html.Br(),
-                                        "- **MAE**：平均絕對誤差，反映擬合誤差的平均絕對值。"
-                                    ],
-                                    style={'font-size': '18px', 'color': '#333333'}
-                                ),
-
-                                # 標記點說明
-                                html.H3(
-                                    children=['標記點說明'],
-                                    style={'font-size': '20px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.P(
-                                    children=[
-                                        "圖中紫色標記點代表特定的IF和VF值，並在圖表中進行了標註。",
-                                        html.Br(),
-                                        "這些標記點有助於直觀地了解在特定IF值下對應的VF值，反之亦然。"
-                                    ],
-                                    style={'font-size': '18px', 'color': '#333333'}
-                                ),
-
-                            ]
-                        ),
-
-                        # 移除存檔按鈕和下載組件
-                        # html.Div([
-                        #     dbc.Button("存檔", id='save-tab1', color="light", style={'margin-top': '20px'}),
-                        #     dcc.Download(id="download-tab1")
-                        # ], style={'textAlign': 'center', 'padding': '20px'})
-                    ])
-                ]),
-                dcc.Tab(label='Tab 2', value='tab-2', children=[
-                    html.Div([
-                        html.P("這是頁籤二的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 3', value='tab-3', children=[
-                    html.Div([
-                        html.P("這是頁籤三的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 4', value='tab-4', children=[
-                    html.Div([
-                        html.P("這是頁籤四的內容。"),
-                        dbc.Button("存檔", id='save-tab4', color="success"),
-                        dcc.Download(id="download-tab4")
-                    ], style={'padding': '20px'})
-                ]),
-            ])
-        ]),
-        className="shadow-sm border mb-4",
-        style={'padding': '10px'}
-    )
-
-def create_loss_analysis_card():
-    # 讀取並處理數據
-    df = load_data(DATA_FILE_PATH)
-    if df.empty:
-        print("DataFrame is empty in create_loss_analysis_card.")  # 調試輸出
-
-    # 定義需要標記的條件
-    highlight_conditions = [
-        {'溫度': 'Tj = 25℃', 'IC (A)': 447.51},
-        {'溫度': 'Tj = 25℃', 'IC (A)': 819.11},
-        {'溫度': 'Tj = 150℃', 'IC (A)': 451.644},
-        {'溫度': 'Tj = 150℃', 'IC (A)': 823.824},
-        {'溫度': 'Tj = 175℃', 'IC (A)': 450.026},
-        {'溫度': 'Tj = 175℃', 'IC (A)': 824.324},
-    ]
-
-    # 生成 style_data_conditional
-    style_data_conditional = [
-        {
-            'if': {
-                'filter_query': f'{{溫度}} = "{cond["溫度"]}" && {{IC (A)}} = {cond["IC (A)"]}',
-            },
-            'backgroundColor': 'lightblue',
-            'color': 'black'
-        }
-        for cond in highlight_conditions
-    ]
-
-    return dbc.Card(
-        dbc.CardBody([
-            html.H5("Characteristics Diagrams", className="card-title"),
-            html.H5("Temperature IC-VCE Curve", style={'textAlign': 'left', 'marginBottom': '20px'}),
-
-            # Radio 按鈕置中，並應用自定義 CSS 類
-            dbc.Row([
-                dbc.Col(
-                    dbc.RadioItems(
-                        options=[
-                            {'label': 'VGE = 15V, IC = f(VCE)', 'value': 'VGE_15V_IC_f_VCE'}
-                        ],
-                        value='VGE_15V_IC_f_VCE',  # 默認選擇
-                        id='icvce-radio1',
-                        inline=True,
-                        className='custom-radio'  # 添加自定義 CSS 類名
-                    ),
-                    width=12,
-                    className='fixed-radio-container'  # 添加固定高度的容器類名
-                )
-            ], className="mb-3"),
-
-            # 圖片顯示
-            html.Div(
-                children=[
-                    html.Img(
-                        id='icvce-image1',
-                        src='/assets/ICVCE15V.png',  # 默認圖片
-                        style={'width': '70%', 'height': 'auto'}
-                    ),
-                ],
-                style={
-                    'padding': '20px',
-                    'textAlign': 'center'
-                }
-            ),
-
-            # 標題顯示在圖片下方
-            html.Div(id='icvce-title1', style={'textAlign': 'center', 'fontSize': '20px', 'marginTop': '10px'}),
-
-            # 溫度選擇與範圍滑桿
-            html.Div([
-                html.Label("選擇溫度 (圖表)", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-graph',
-                    options=[
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'},
-                        {'label': '所有溫度', 'value': 'all_temperatures'}  # 將「所有溫度」設為選項
-                    ],
-                    value='all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 IC 範圍 (A)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_ic-range-slider',
-                    min=-100,  # 修改為 -100
-                    max=1800,  # 假設最大IC值為1800A
-                    step=10,  # 設置步長為10A
-                    marks={i: str(i) for i in range(0, 1801, 100)},
-                    value=[0, 1800],
-                    allowCross=False,
-                    className='ic-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_ic-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 VCE 範圍 (V)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_vce-range-slider',
-                    min=-1,  # 修改為 -1
-                    max=4,  # 調整為4V
-                    step=0.1,  # 設置步長為0.1V
-                    marks={i: str(i) for i in range(-1, 5)},  # 標記從-1到4
-                    value=[-1, 4],  # 默認值為-1到4V
-                    allowCross=False,
-                    className='vce-slider'  # 自定義CSS類名
-                ),
-                html.Div(id='loss_vce-output', style={'margin-top': '10px'})
-            ], style={'margin': '20px 0'}),
-            # 損耗分析圖表
-            dcc.Graph(id='loss_loss-graph', style={'margin-bottom': '50px'},
-                      config={'displayModeBar': False,  # 顯示工具列
-                              'displaylogo': False  # 是否隱藏 Plotly 的 logo
-                              }
-                      ),  # 損耗分析圖表
-            # 溫度選擇表格
-            html.Div([
-                html.Label("選擇溫度", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-table',
-                    options=[
-                        {'label': '所有溫度', 'value': 'all_temperatures'},  # 將「所有溫度」設為選項
-                        {'label': 'Tj = 25℃', 'value': 'Tj_25C_IC_f_VCE'},
-                        {'label': 'Tj = 150℃', 'value': 'Tj_150C_IC_f_VCE'},
-                        {'label': 'Tj = 175℃', 'value': 'Tj_175C_IC_f_VCE'}
-                    ],
-                    value='all_temperatures',  # 默認顯示所有溫度
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            # 損耗分析表格
-            dash_table.DataTable(
-                id='loss_loss-table',
-                style_table={'overflowX': 'auto'},
-                page_size=30,
-                filter_action='native',  # 啟用過濾功能
-                columns=[  # 預設欄位，稍後動態更新
-                    {"name": "Index", "id": "編號"},
-                    {"name": "Temperature (°C)", "id": "溫度"},
-                    {"name": "IC (A)", "id": "IC (A)"},
-                    {"name": "VCE (V)", "id": "VCE (V)"}
-                ],
-                style_cell={
-                    'fontFamily': 'Arial, sans-serif',  # 與其他字體一致
-                    'fontSize': 17,  # 字體大小
-                    'textAlign': 'center',  # 預設文本對齊方式
-                    'padding': '5px'  # 單元格內邊距
-                },
-                style_data_conditional=style_data_conditional
-            ),
-            # Card1_新增 Tabs 區塊
-            html.Hr(style={'margin': '20px 0'}),
-            html.H5("相關分析", className="card-title"),
-            dcc.Tabs(id='additional-tabs', value='tab-1', children=[
-                dcc.Tab(label='Tab 1', value='tab-1', children=[
-                    html.Div([
-                        # 新增圖像區塊
-                        html.Div(
-                            children=[
-                                html.Img(
-                                    src=f'data:image/png;base64,{encoded_image_tab1}',
-                                    className='zoomable',  # 添加放大鏡CSS類
-                                    style={'width': '100%', 'height': 'auto'}  # 調整寬度為100%
-                                ),
-                            ],
-                            style={
-                                'padding': '20px',
-                                'textAlign': 'center'
-                            }
-                        ),
-
-                        # 新增文本區塊
-                        html.Div(
-                            children=[
-                                # 定義主標題
-                                html.H3(
-                                    children=['I-V特性曲線圖表中，具體分析的項目包括：'],
-                                    style={
-                                        'margin-bottom': '0px',
-                                        'color': '#02294f',  # 深藍色
-                                        'margin-top': '20px',
-                                        'font-size': '20px',  # 調整字體大小
-                                        'font-weight': 'bold'  # 加粗
-                                    }
-                                ),
-                                # 定義段落並允許斷行
-                                html.P(
-                                    children=[
-                                        "線性區與飽和區的劃分：",
-                                        html.Br(),
-                                        "線性區域：當電壓VCE較低時，IGBT處於線性區域，電流IC與VCE的關係基本線性。該區域的斜率代表輸出電阻特性。",
-                                        html.Br(),
-                                        "飽和區域：當VCE增加到一定值（飽和門檻），IGBT進入飽和狀態，IC與VCE之間的變化變得非線性。",
-                                    ],
-                                    style={
-                                        'white-space': 'pre-line',  # 允許斷行
-                                        'color': '#333333',  # 深灰色
-                                        'margin-top': '0px',
-                                        'margin-bottom': '20px',
-                                        'font-size': '14px'  # 調整字體大小
-                                    }
-                                ),
-                                # 能量E的計算
-                                html.H3(
-                                    children=['能量E的計算：'],
-                                    style={'font-size': '20px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.Details([
-                                    html.Summary(
-                                        '顯示計算公式',
-                                        style={
-                                            'font-size': '16px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                                        線性區域和飽和區域能量E：這些值是通過對對應區域的電壓和電流積分求得，具體公式：
-
-                                        $$
-                                        E = \int_{V_{\text{start}}}^{V_{\text{end}}} IC \cdot dV_{CE}
-                                        $$
-
-                                        其中，$V_{\text{start}}$ 和 $V_{\text{end}}$ 分別代表積分的起始和結束電壓。這是對應區域的能量耗散。
-                                    ''', mathjax=True)
-                                ]),
-                                # 斜率的計算
-                                html.H3(
-                                    children=['斜率的計算：'],
-                                    style={'font-size': '16px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.P(
-                                    children=[
-                                        "在線性區域中計算斜率：斜率（m）可以通過取兩個點的電流和電壓值計算，具體公式：",
-                                        html.Br(),
-                                        dcc.Markdown(r'''
-                                            $$
-                                            m = \frac{\Delta IC}{\Delta V_{CE}}
-                                            $$
-                                            這個斜率代表了元件的電導率。
-                                        ''', mathjax=True)
-                                    ],
-                                    style={'font-size': '14px', 'color': '#333333'}
-                                ),
-                                # 擬合曲線與決定係數R²
-                                html.H3(
-                                    children=['擬合曲線與決定係數R²：'],
-                                    style={'font-size': '16px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.P(
-                                    children=[
-                                        "擬合曲線使用多項式或其他擬合方法，以求得電流與電壓的擬合方程。使用的擬合算法例如線性回歸或多項式回歸，並計算決定係數R²來評估擬合的準確性。",
-                                        html.Br(),
-                                        "例如，假設使用二次多項式擬合，擬合方程可以表示為：",
-                                        html.Br(),
-                                        dcc.Markdown(r'''
-                                            $$
-                                            IC = a \cdot V_{CE}^2 + b \cdot V_{CE} + c
-                                            $$
-                                            再通過最小二乘法來求得參數 $a, b, c$。
-                                        ''', mathjax=True),
-                                        html.Br(),
-                                        "這些分析幫助我們理解IGBT在不同結溫和工作狀態下的性能，並為進一步優化和設計提供參考。"
-                                    ],
-                                    style={'font-size': '14px', 'color': '#333333'}
-                                ),
-                                # 新增的 R² 說明段落
-                                html.H3(
-                                    children=['R²（決定係數）的詳細說明：'],
-                                    style={'font-size': '16px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.Details([
-                                    html.Summary(
-                                        '顯示 R² 的解釋',
-                                        style={
-                                            'font-size': '14px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                                        **R²（決定係數）** 是用來評估擬合曲線的準確度的指標。R²的值範圍從 0 到 1：
-
-                                        - **R² = 1**：代表擬合非常完美，所有數據點都精確地落在擬合曲線上。
-                                        - **R² 越接近 1**：表示擬合曲線越能解釋數據變化，準確度越高。
-                                        - **R² 接近 0**：表示擬合曲線無法很好地解釋數據變化，擬合效果較差。
-
-                                        在圖中，每條擬合曲線的旁邊都有標記R²值，這些值用來顯示該曲線對數據的擬合程度。例如，圖中顯示的R²值為 1.000，說明這些擬合曲線對應的數據點幾乎完全匹配，擬合效果非常好。
-
-                                        **R²的計算公式如下：**
-
-                                        $$
-                                        R^2 = 1 - \frac{\sum{(y_i - \hat{y}_i)^2}}{\sum{(y_i - \overline{y})^2}}
-                                        $$
-
-                                        其中：
-
-                                        - $y_i$ 是實際數據點值。
-                                        - $\hat{y}_i$ 是擬合曲線上的預測值。
-                                        - $\overline{y}$ 是實際數據的平均值。
-
-                                        這個公式用來衡量擬合的誤差（分子部分）與總變異（分母部分）之間的比率。當擬合誤差越小時，R²越接近1。
-                                    ''', mathjax=True)
-                                ]),
-                            ],
-                            style={'padding': '15px', 'font-size': '14px'}  # 全局縮小字體大小
-                        ),
-
-                        # 移除存檔按鈕和下載組件
-                        # html.Div([
-                        #     dbc.Button("存檔", id='save-tab1', color="light", style={'margin-top': '20px'}),
-                        #     dcc.Download(id="download-tab1")
-                        # ], style={'textAlign': 'center', 'padding': '20px'})
-                    ])
-                ]),
-                dcc.Tab(label='Tab 2', value='tab-2', children=[
-                    html.Div([
-                        # 圖像區塊
-                        html.Div(
-                            children=[
-                                html.Img(
-                                    src=f'data:image/png;base64,{encoded_image_tab2}',
-                                    className='zoomable',  # 添加放大鏡CSS類
-                                    style={'width': '90%', 'height': 'auto'}  # 調整寬度為90%
-                                ),
-                            ],
-                            style={
-                                'padding': '20px',
-                                'textAlign': 'center'
-                            }
-                        ),
-
-                        # 文本區塊
-                        html.Div(
-                            children=[
-                                html.P(
-                                    '圖表在三個不同結點溫度（25°C、150°C、175°C）下總能量損失，'
-                                    '縱軸是能量損失（J），橫軸顯示的是結點溫度，每個條形柱代表一個特定溫度下的能量損失，'
-                                    '並且每個柱形頂部標示了具體的能量損失值，紅色的虛線標示了平均能量損失值對比基準。'
-                                ),
-                                html.Ul([
-                                    html.Li('25°C：總能量損失為 1148 J'),
-                                    html.Li('150°C：總能量損失為 1230 J'),
-                                    html.Li('175°C：總能量損失為 1312 J'),
-                                    html.Li(
-                                        '平均能量損失基準線：紅色虛線表示平均能量損失，大約為 1200 J，'
-                                        '25°C 時的能量損失低於平均值，而 150°C 和 175°C 均超過了平均值。'
-                                    )
-                                ]),
-                                html.H3('功率計算：',
-                                        style={'font-size': '18px', 'font-weight': 'bold', 'color': '#003366'}),
-                                dcc.Markdown(r'''
-                                **功率計算公式**：
-
-                                $$
-                                P = V_{CE} \times IC
-                                $$
-                                ''', mathjax=True),
-                                html.Details([
-                                    html.Summary(
-                                        '計算範例',
-                                        style={'cursor': 'pointer', 'font-weight': 'bold'}
-                                    ),
-                                    dcc.Markdown(r'''
-                                        25°C：
-                                        $$
-                                        P_{25} = 1.4 \times 820 = 1148 \, W
-                                        $$
-
-                                        150°C：
-                                        $$
-                                        P_{150} = 1.5 \times 820 = 1230 \, W
-                                        $$
-
-                                        175°C：
-                                        $$
-                                        P_{175} = 1.6 \times 820 = 1312 \, W
-                                        $$
-                                    ''', mathjax=True)
-                                ]),
-                                html.H3('能量損耗計算：',
-                                        style={'font-size': '18px', 'font-weight': 'bold', 'color': '#003366'}),
-                                dcc.Markdown(r'''
-                                **能量損耗計算公式**：
-
-                                $$
-                                E = P \times t
-                                $$
-                                ''', mathjax=True),
-                                html.Details([
-                                    html.Summary(
-                                        '計算範例',
-                                        style={'cursor': 'pointer', 'font-weight': 'bold'}
-                                    ),
-                                    dcc.Markdown(r'''
-                                        25°C：
-                                        $$
-                                        E_{25} = 1148 \, W \times 1 \, s = 1148 \, J
-                                        $$
-
-                                        150°C：
-                                        $$
-                                        E_{150} = 1230 \, W \times 1 \, s = 1230 \, J
-                                        $$
-
-                                        175°C：
-                                        $$
-                                        E_{175} = 1312 \, W \times 1 \, s = 1312 \, J
-                                        $$
-                                    ''', mathjax=True)
-                                ]),
-                                html.H3('能效分析',
-                                        style={'font-size': '18px', 'font-weight': 'bold', 'color': '#003366'}),
-                                dcc.Markdown(r'''
-                                **能效計算公式**：
-
-                                $$
-                                \eta = \frac{E_{in} - E_{loss}}{E_{in}} \times 100\%
-                                $$
-                                ''', mathjax=True),
-                                html.Details([
-                                    html.Summary(
-                                        '計算範例',
-                                        style={'cursor': 'pointer', 'font-weight': 'bold'}
-                                    ),
-                                    dcc.Markdown(r'''
-                                        假設在 25°C 時：
-                                        $$
-                                        E_{in} = 1500 \, J, \quad E_{loss} = 1148 \, J
-                                        $$
-
-                                        能效：
-                                        $$
-                                        \eta_{25} = \frac{1500 - 1148}{1500} \times 100\% = 23.47\%
-                                        $$
-
-                                        這表示系統在 25°C 時能有效利用 23.47% 的輸入能量。
-                                    ''', mathjax=True)
-                                ])
-                            ],
-                            style={'padding': '15px', 'font-size': '14px', 'line-height': '1.6'}
-                        ),
-                        # 移除存檔按鈕和下載組件
-                        # html.Div([
-                        #     dbc.Button("存檔", id='save-tab2', color="light", style={'margin-top': '20px'}),
-                        #     dcc.Download(id="download-tab2")
-                        # ], style={'textAlign': 'center', 'padding': '20px'})
-                    ])
-                ]),
-                dcc.Tab(label='Tab 3', value='tab-3', children=[
-                    html.Div([
-                        html.P("這是頁籤三的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 4', value='tab-4', children=[
-                    html.Div([
-                        html.P("這是頁籤四的內容。"),
-                        dbc.Button("存檔", id='save-tab4', color="success"),
-                        dcc.Download(id="download-tab4")
-                    ], style={'padding': '20px'})
-                ]),
-            ])
-        ]),
-        className="shadow-sm border mb-4",
-        style={'padding': '10px'}
-    )
-
-# 新增的 Characteristics Diagrams2 卡片創建函數
-def create_loss_analysis_card2():
-    # 讀取並處理數據
-    # 根據需求，這裡暫不讀取數據
-
-    # 定義需要標記的條件（根據實際需求修改）
-    highlight_conditions = [
-        {'Voltage (V)': '11V', 'IC (A)': 443.24},
-        {'Voltage (V)': '11V', 'IC (A)': 813.68},
-        {'Voltage (V)': '13V', 'IC (A)': 500.00},
-        {'Voltage (V)': '13V', 'IC (A)': 900.00},
-        {'Voltage (V)': '15V', 'IC (A)': 500.00},
-        {'Voltage (V)': '15V', 'IC (A)': 900.00},
-        {'Voltage (V)': '17V', 'IC (A)': 500.00},
-        {'Voltage (V)': '17V', 'IC (A)': 900.00},
-        {'Voltage (V)': '19V', 'IC (A)': 500.00},
-        {'Voltage (V)': '19V', 'IC (A)': 900.00},
-    ]
-
-    # 生成 style_data_conditional
-    style_data_conditional = [
-        {
-            'if': {
-                'filter_query': f'{{Voltage (V)}} = "{cond["Voltage (V)"]}" && {{IC (A)}} = {cond["IC (A)"]}',
-            },
-            'backgroundColor': 'lightgreen',  # 不同顏色以區分
-            'color': 'black'
-        }
-        for cond in highlight_conditions
-    ]
-
-    return dbc.Card(
-        dbc.CardBody([
-            html.H5("Characteristics Diagrams2", className="card-title"),
-
-            html.H5("Voltage IC-VCE Curve", style={'textAlign': 'left', 'marginBottom': '20px'}),
-
-            # Radio 按鈕置中，並應用自定義 CSS 類
-            dbc.Row([
-                dbc.Col(
-                    dbc.RadioItems(
-                        options=[
-                            {'label': 'Tj = 25℃, IC = f(VCE)', 'value': 'Tj_25C_IC_f_VCE'},
-                            {'label': 'Tj = 150℃, IC = f(VCE)', 'value': 'Tj_150C_IC_f_VCE'}
-                            # 如果需要更多選項，可以在這裡添加
-                        ],
-                        value='Tj_25C_IC_f_VCE',  # 默認選擇
-                        id='icvce-radio2',
-                        inline=True,
-                        className='custom-radio'  # 添加自定義 CSS 類名
-                    ),
-                    width=12,
-                    className='fixed-radio-container'  # 添加固定高度的容器類名
-                )
-            ], className="mb-3"),
-
-            # 圖片顯示
-            html.Div(
-                children=[
-                    html.Img(
-                        id='icvce-image2',
-                        src='/assets/ICVCE25.png',  # 默認圖片，將在回調中更新
-                        style={'width': '70%', 'height': 'auto'}
-                    ),
-                ],
-                style={
-                    'padding': '20px',
-                    'textAlign': 'center'
-                }
-            ),
-
-            # 標題顯示在圖片下方
-            html.Div(id='icvce-title2', style={'textAlign': 'center', 'fontSize': '20px', 'marginTop': '10px'}),
-
-            # 電壓選擇與範圍滑桿（使用不同的ID）
-            html.Div([
-                html.Label("選擇電壓 (圖表)", style={'fontSize': '18px'}),  # 原有設置標籤名稱選擇IC, VCE (圖表)
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-graph2',  # 新的ID
-                    options=[
-                        {'label': '9V', 'value': 'IC_9V_VCE_9V'},
-                        {'label': '11V', 'value': 'IC_11V_VCE_11V'},
-                        {'label': '13V', 'value': 'IC_13V_VCE_13V'},
-                        {'label': '15V', 'value': 'IC_15V_VCE_15V'},
-                        {'label': '17V', 'value': 'IC_17V_VCE_17V'},
-                        {'label': '19V', 'value': 'IC_19V_VCE_19V'},
-                        {'label': '所有電壓', 'value': 'all_voltages'}  # 新增「所有電壓」選項
-                    ],
-                    value='all_voltages',  # 默認選擇「所有電壓」
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 IC 範圍 (A)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_ic-range-slider2',  # 新的ID
-                    min=-100,  # 修改為 -100
-                    max=1700,
-                    step=10,
-                    marks={i: str(i) for i in range(-100, 1701, 100)},
-                    value=[-100, 1700],
-                    allowCross=False,
-                    className='ic-slider'
-                ),
-                html.Div(id='loss_ic-output2', style={'margin-top': '10px'})  # 新的ID
-            ], style={'margin': '20px 0'}),
-            html.Div([
-                html.Label("選擇 VCE 範圍 (V)", style={'fontSize': '18px'}),
-                dcc.RangeSlider(
-                    id='loss_vce-range-slider2',  # 新的ID
-                    min=-1,  # 修改為 -1
-                    max=4,  # 調整為4V
-                    step=0.1,  # 設置步長為0.1V
-                    marks={i: str(i) for i in range(-1, 5)},  # 標記從-1到4
-                    value=[-1, 4],  # 默認值為-1到4V
-                    allowCross=False,
-                    className='vce-slider'
-                ),
-                html.Div(id='loss_vce-output2', style={'margin-top': '10px'})  # 新的ID
-            ], style={'margin': '20px 0'}),
-            # 損耗分析圖表（使用不同的ID）
-            dcc.Graph(id='loss_loss-graph2', style={'margin-bottom': '50px'},
-                      config={'displayModeBar': False,  # 顯示工具列
-                              'displaylogo': False  # 是否隱藏 Plotly 的 logo
-                              }
-                      ),
-            # 電壓選擇表格
-            html.Div([
-                html.Label("選擇電壓", style={'fontSize': '18px'}),
-                dcc.Dropdown(
-                    id='loss_temperature-dropdown-table2',  # 新的ID
-                    options=[
-                        {'label': '9V', 'value': 'IC_9V_VCE_9V'},
-                        {'label': '11V', 'value': 'IC_11V_VCE_11V'},
-                        {'label': '13V', 'value': 'IC_13V_VCE_13V'},
-                        {'label': '15V', 'value': 'IC_15V_VCE_15V'},
-                        {'label': '17V', 'value': 'IC_17V_VCE_17V'},
-                        {'label': '19V', 'value': 'IC_19V_VCE_19V'},
-                        {'label': '所有電壓', 'value': 'all_voltages'}  # 新增「所有電壓」選項
-                    ],
-                    value='all_voltages',  # 默認選擇「所有電壓」
-                    clearable=False
-                ),
-            ], style={'margin': '20px 0'}),
-            # 損耗分析表格（使用不同的ID）
-            dash_table.DataTable(
-                id='loss_loss-table2',  # 新的ID
-                style_table={'overflowX': 'auto'},
-                page_size=30,
-                filter_action='native',
-                columns=[
-                    {"name": "Index", "id": "編號"},
-                    {"name": "Voltage (V)", "id": "Voltage (V)"},  # 修正欄位ID
-                    {"name": "IC (A)", "id": "IC (A)"},
-                    {"name": "VCE (V)", "id": "VCE (V)"}
-                ],
-                style_cell={
-                    'fontFamily': 'Arial, sans-serif',  # 與其他字體一致
-                    'fontSize': 17,  # 字體大小
-                    'textAlign': 'center',  # 預設文本對齊方式
-                    'padding': '5px'  # 單元格內邊距
-                },
-                style_data_conditional=style_data_conditional  # 使用新的樣式條件
-            ),
-            # Card2_新增 Tabs 區塊（可以根據需要修改）
-            html.Hr(style={'margin': '20px 0'}),
-            html.H5("相關分析2", className="card-title"),
-            dcc.Tabs(id='additional-tabs2', value='tab-1', children=[
-                dcc.Tab(label='Tab 1', value='tab-1', children=[
-                    html.Div([
-                        # 新增圖像區塊
-                        html.Div(
-                            children=[
-                                html.Img(
-                                    src=f'data:image/png;base64,{encoded_image_tab2}',  # 修改為 encoded_image_tab2
-                                    className='zoomable',  # 添加放大鏡CSS類
-                                    style={'width': '100%', 'height': 'auto'}
-                                ),
-                            ],
-                            style={
-                                'padding': '20px',
-                                'textAlign': 'center'
-                            }
-                        ),
-
-                        # 新增文本區塊
-                        html.Div(
-                            children=[
-                                # 定義主標題
-                                html.H3(
-                                    children=['I-V特性曲線圖表中，具體分析的項目包括：'],
-                                    style={
-                                        'margin-bottom': '0px',
-                                        'color': '#02294f',
-                                        'margin-top': '20px',
-                                        'font-size': '20px',
-                                        'font-weight': 'bold'
-                                    }
-                                ),
-                                # 定義段落並允許斷行
-                                html.P(
-                                    children=[
-                                        "線性區與飽和區的劃分：",
-                                        html.Br(),
-                                        "線性區域：當電壓VCE較低時，IGBT處於線性區域，電流IC與VCE的關係基本線性。該區域的斜率代表輸出電阻特性。",
-                                        html.Br(),
-                                        "飽和區域：當VCE增加到一定值（飽和門檻），IGBT進入飽和狀態，IC與VCE之間的變化變得非線性。",
-                                    ],
-                                    style={
-                                        'white-space': 'pre-line',
-                                        'color': '#333333',
-                                        'margin-top': '0px',
-                                        'margin-bottom': '20px',
-                                        'font-size': '14px'
-                                    }
-                                ),
-                                # 能量E的計算
-                                html.H3(
-                                    children=['能量E的計算：'],
-                                    style={'font-size': '20px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.Details([
-                                    html.Summary(
-                                        '顯示計算公式',
-                                        style={
-                                            'font-size': '16px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                                        線性區域和飽和區域能量E：這些值是通過對對應區域的電壓和電流積分求得，具體公式：
-
-                                        $$
-                                        E = \int_{V_{\text{start}}}^{V_{\text{end}}} IC \cdot dV_{CE}
-                                        $$
-
-                                        其中，$V_{\text{start}}$ 和 $V_{\text{end}}$ 分別代表積分的起始和結束電壓。這是對應區域的能量耗散。
-                                    ''', mathjax=True)
-                                ]),
-                                # 斜率的計算
-                                html.H3(
-                                    children=['斜率的計算：'],
-                                    style={'font-size': '16px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.P(
-                                    children=[
-                                        "在線性區域中計算斜率：斜率（m）可以通過取兩個點的電流和電壓值計算，具體公式：",
-                                        html.Br(),
-                                        dcc.Markdown(r'''
-                                            $$
-                                            m = \frac{\Delta IC}{\Delta V_{CE}}
-                                            $$
-                                            這個斜率代表了元件的電導率。
-                                        ''', mathjax=True)
-                                    ],
-                                    style={'font-size': '14px', 'color': '#333333'}
-                                ),
-                                # 擬合曲線與決定係數R²
-                                html.H3(
-                                    children=['擬合曲線與決定係數R²：'],
-                                    style={'font-size': '16px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.P(
-                                    children=[
-                                        "擬合曲線使用多項式或其他擬合方法，以求得電流與電壓的擬合方程。使用的擬合算法例如線性回歸或多項式回歸，並計算決定係數R²來評估擬合的準確性。",
-                                        html.Br(),
-                                        "例如，假設使用二次多項式擬合，擬合方程可以表示為：",
-                                        html.Br(),
-                                        dcc.Markdown(r'''
-                                            $$
-                                            IC = a \cdot V_{CE}^2 + b \cdot V_{CE} + c
-                                            $$
-                                            再通過最小二乘法來求得參數 $a, b, c$。
-                                        ''', mathjax=True),
-                                        html.Br(),
-                                        "這些分析幫助我們理解IGBT在不同結溫和工作狀態下的性能，並為進一步優化和設計提供參考。"
-                                    ],
-                                    style={'font-size': '14px', 'color': '#333333'}
-                                ),
-                                # 新增的 R² 說明段落
-                                html.H3(
-                                    children=['R²（決定係數）的詳細說明：'],
-                                    style={'font-size': '16px', 'font-weight': 'bold', 'color': '#003366'}
-                                ),
-                                html.Details([
-                                    html.Summary(
-                                        '顯示 R² 的解釋',
-                                        style={
-                                            'font-size': '14px',
-                                            'font-weight': 'bold',
-                                            'color': '#003366',
-                                        }
-                                    ),
-                                    dcc.Markdown(r'''
-                                        **R²（決定係數）** 是用來評估擬合曲線的準確度的指標。R²的值範圍從 0 到 1：
-
-                                        - **R² = 1**：代表擬合非常完美，所有數據點都精確地落在擬合曲線上。
-                                        - **R² 越接近 1**：表示擬合曲線越能解釋數據變化，準確度越高。
-                                        - **R² 接近 0**：表示擬合曲線無法很好地解釋數據變化，擬合效果較差。
-
-                                        在圖中，每條擬合曲線的旁邊都有標記R²值，這些值用來顯示該曲線對數據的擬合程度。例如，圖中顯示的R²值為 1.000，說明這些擬合曲線對應的數據點幾乎完全匹配，擬合效果非常好。
-
-                                        **R²的計算公式如下：**
-
-                                        $$
-                                        R^2 = 1 - \frac{\sum{(y_i - \hat{y}_i)^2}}{\sum{(y_i - \overline{y})^2}}
-                                        $$
-
-                                        其中：
-
-                                        - $y_i$ 是實際數據點值。
-                                        - $\hat{y}_i$ 是擬合曲線上的預測值。
-                                        - $\overline{y}$ 是實際數據的平均值。
-
-                                        這個公式用來衡量擬合的誤差（分子部分）與總變異（分母部分）之間的比率。當擬合誤差越小時，R²越接近1。
-                                    ''', mathjax=True)
-                                ]),
-                            ],
-                            style={'padding': '15px', 'font-size': '14px'}  # 全局縮小字體大小
-                        ),
-
-                        # 移除存檔按鈕和下載組件
-                        # html.Div([
-                        #     dbc.Button("存檔", id='save-tab1-2', color="light", style={'margin-top': '20px'}),
-                        #     dcc.Download(id="download-tab1-2")
-                        # ], style={'textAlign': 'center', 'padding': '20px'})
-                    ])
-                ]),
-                dcc.Tab(label='Tab 2', value='tab-2', children=[
-                    html.Div([
-                        html.P("這是頁籤二的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 3', value='tab-3', children=[
-                    html.Div([
-                        html.P("這是頁籤三的內容。"),
-                        dbc.Button("存檔", id='save-tab3', color="success"),
-                        dcc.Download(id="download-tab3")
-                    ], style={'padding': '20px'})
-                ]),
-                dcc.Tab(label='Tab 4', value='tab-4', children=[
-                    html.Div([
-                        html.P("這是頁籤四的內容。"),
-                        dbc.Button("存檔", id='save-tab4', color="success"),
-                        dcc.Download(id="download-tab4")
-                    ], style={'padding': '20px'})
-                ]),
-            ])
-        ]),
-        className="shadow-sm border mb-4",
-        style={'padding': '10px'}
-    )
-
-
-
-# 定義佈局
-app.layout = html.Div([
-    # 第一個區塊：標題區
-    html.Div([
-        html.H1("Diagrams Analysis", style={'textAlign': 'center', 'marginBottom': '-3px' , 'fontSize': '28px','color': '#495057' }),
-        #html.Hr(style={'borderWidth': '2px'}),  # 添加分隔線
-    ], style={'padding': '20px', 'backgroundColor': '#f8f9fa'}),  # 添加背景顏色
-
-    # 第二個區塊：下拉選單區
+# 定義 Diagrams1 的整合佈局
+diagrams1_layout = html.Div([
     dbc.Row([
         dbc.Col([
-            # 使用單一 Row 包含四個 Column，以減少間距
             dbc.Row([
-                dbc.Col([
-                    html.Label("PRODUCT"),
-                    dcc.Dropdown(
-                        id='category1-dropdown',
-                        options=[
-                            {'label': 'HPD IGBT', 'value': 'HPD IGBT'},
-                            {'label': 'IGBT ED3', 'value': 'IGBT ED3'},
-                            {'label': 'IGBT EP2', 'value': 'IGBT EP2'},
-                            {'label': 'SiC ED3', 'value': 'SiC ED3'},
-                            {'label': 'SiC HPD', 'value': 'SiC HPD'},
-                            {'label': 'SiC SSC', 'value': 'SiC SSC'}
-                        ],
-                        value='HPD IGBT',
-                        clearable=False,
-                        style={'marginBottom': '10px', 'width': '100%'}
-                    ),
-                ], width=3, style={'paddingRight': '10px'}),
-
-                dbc.Col([
-                    html.Label("POWER"),
-                    dcc.Dropdown(
-                        id='category2-dropdown',
-                        options=[],  # 初始為空，根據 PRODUCT 更新
-                        clearable=False,
-                        style={'marginBottom': '10px', 'width': '100%'}
-                    ),
-                ], width=3, style={'paddingRight': '10px'}),
-
-                dbc.Col([
-                    html.Label("DEVICE TYPE"),
-                    dcc.Dropdown(
-                        id='device-type-dropdown',
-                        options=[],  # 初始為空，根據 POWER 更新
-                        clearable=False,
-                        style={'marginBottom': '10px', 'width': '100%'}
-                    ),
-                ], width=3, style={'paddingRight': '10px'}),
-
-                dbc.Col([
-                    html.Label("PROPERTY"),
-                    dcc.Dropdown(
-                        id='property-dropdown',
-                        options=[],  # 初始為空，根據 DEVICE TYPE 更新
-                        disabled=True,
-                        clearable=False,
-                        style={'marginBottom': '10px', 'width': '100%'}
-                    ),
-                ], width=3),
-            ], className="g-1"),  # 最小化 gutter
-        ], width=12),
-    ], style={'padding': '20px', 'backgroundColor': '#f1f1f1'}),
-
-    # 主要卡片區域
-    #dbc.Row([
-        # 使用 justify="center" 來置中子列
-        #dbc.Row([
-           # dbc.Col([
-                # 損耗分析卡片
-              #  create_loss_analysis_card()
-           # ], md=5, className='mb-4'),  # 半寬
-
-           # dbc.Col([
-                # 新增的損耗分析卡片
-               # create_loss_analysis_card2()
-          #  ], md=5, className='mb-4')  # 半寬
-       # ], justify="center")  # 置中對齊
-   # ], className="mb-4"),
-
-    dbc.Row([
-        dbc.Col(
-            html.Div(id='cards-container'),  # 動態容器
-            width=12
-        )
-    ], className="mb-4"),
-
-    # 新增的額外 Tabs 區塊
-    # (已經在 create_loss_analysis_card 和 create_loss_analysis_card2 中定義，無需再次定義)
+                dbc.Col(create_upload_card("IGBT, Output characteristics", "VGE = 15V, IC = f(VCE)", "upload-tj25",
+                                           "graph-tj25"), md=6),
+                dbc.Col(create_upload_card("IGBT, Output characteristics", "Tj = 25°C, IC = f(VCE)", "upload-tj150",
+                                           "graph-tj150"), md=6),
+            ], justify="center", className="mb-4"),
+            dbc.Row([
+                dbc.Col(create_upload_card("IGBT, Output characteristics", "Tj = 150°C, IC = f(VCE)", "upload-tj175",
+                                           "graph-tj175"), md=6),
+                dbc.Col(create_upload_card("Diode, Forward characteristics", "IF = f(VF)", "upload-tjD", "graph-tjD"),
+                        md=6),
+            ], justify="center", className="mb-4"),
+            dbc.Row([
+                dbc.Col(create_upload_card("IGBT, Switching losses vs. IC",
+                                           "VGE = -8V / +15V, RG,on = 2.5 Ω, RG,off = 5.0 Ω, VCE = 400V, Eon & Eoff = f(Ic)",
+                                           "upload-tjE", "graph-tjE"), md=6),
+                dbc.Col(create_upload_card("IGBT, Switching losses vs. RG",
+                                           "VGE = -8V / +15V, VCE = 400V, IC = 300A, Eon & Eoff = f(RG)", "upload-tjF",
+                                           "graph-tjF"), md=6),
+            ], justify="center", className="mb-4"),
+            dbc.Row([
+                dbc.Col(create_upload_card("IGBT Capacitance characteristics",
+                                           "VGE = 0V, Tj = 25°C, f = 100kHz, C = f(VCE)", "upload-tjG", "graph-tjG"),
+                        md=6),
+                dbc.Col(create_upload_card("NTC-Thermistor-temperature characteristics", "R = f(TNTC)", "upload-extra1",
+                                           "graph-extra1"), md=6),
+            ], justify="center", className="mb-4"),
+            dbc.Row([
+                dbc.Col(create_upload_card("Diode, Switching losses vs. IF", "RG = 2.5 Ω, VR = 400V, Erec = f(IF)",
+                                           "upload-extra2", "graph-extra2"), md=6),
+                dbc.Col(create_upload_card("Diode, Switching losses vs. RG", "IF = 300A, VR = 400V, Erec = f(RG)",
+                                           "upload-extra3", "graph-extra3"), md=6),
+            ], justify="center", className="mb-4"),
+            dbc.Row([
+                dbc.Col(create_upload_card("Reverse bias safe operating area (RBSOA)",
+                                           "VGE = -8V / + 15V, RG,off = 5.0 Ω, Tj = 175°C", "upload-extra4",
+                                           "graph-extra4"), md=6),
+                dbc.Col(create_upload_card("IGBT Total Gate Charge characteristic",
+                                           "VCE = 400 V, IC = 300A, Tj = 25°C, VGE = f(QG)", "upload-extra5",
+                                           "graph-extra5"), md=6),
+            ], justify="center", className="mb-4"),
+            dbc.Row([
+                dbc.Col(create_upload_card("IGBT Transient thermal impedance",
+                                           "ZthJF = f(tP), ΔV/Δt = 10 dm3/min, TF = 70°C", "upload-extra6",
+                                           "graph-extra6"), md=6),
+                dbc.Col(create_upload_card("Diode Transient thermal impedance",
+                                           "ZthJF = f(tP), ΔV/Δt = 10 dm3/min, TF = 70°C", "upload-extra7",
+                                           "graph-extra7"), md=6),
+            ], justify="center", className="mb-4"),
+        ], width=10, className="mx-auto")  # 設定主區域寬度為10，並居中
+    ]),
+    # 新增模態窗口，用於顯示 CSV 數據
+    dbc.Modal(
+        [
+            dbc.ModalHeader(dbc.ModalTitle("CSV Data")),
+            dbc.ModalBody(id="modal-body"),
+            dbc.ModalFooter(
+                dbc.Button("Close", id="close-modal", className="ms-auto", n_clicks=0)
+            ),
+        ],
+        id="data-modal",
+        is_open=False,
+        size="xl",
+        scrollable=True,
+    ),
+    # 新增下載組件和儲存組件
+    dcc.Download(id='download-image'),
+    dcc.Store(id='download-store'),
 ])
 
-# 根據 PRODUCT 更新 POWER 選項的回調函數
-@app.callback(
-    Output('category2-dropdown', 'options'),
-    Input('category1-dropdown', 'value')
+# 定義 Contact 頁面的佈局
+contact_layout = dbc.Container(
+    [
+        html.H2("聯絡我們", className="mt-4"),
+        html.P("這是聯絡頁面的內容。"),
+    ],
+    fluid=True,
 )
-def update_power_options(selected_product):
-    print(f"Selected PRODUCT: {selected_product}")  # 調試輸出
-    power_options = {
-        'HPD IGBT': [
-            {'label': '750V820A', 'value': '750V820A'},
-            {'label': '750V550A', 'value': '750V550A'},
-            {'label': '1200V820A', 'value': '1200V820A'}
-        ],
-        'IGBT ED3': [
-            {'label': '1200V450A', 'value': '1200V450A'},
-            {'label': '1200V600A', 'value': '1200V600A'}
-        ],
-        'IGBT EP2': [
-            {'label': '1200V75A', 'value': '1200V75A'}
-        ],
-        'SiC ED3': [
-            {'label': '1200V450A', 'value': '1200V450A'},
-            {'label': '1200V600A', 'value': '1200V600A'}
-        ],
-        'SiC HPD': [
-            {'label': '1200V400A', 'value': '1200V400A'}
-        ],
-        'SiC SSC': [
-            {'label': '1200V600A', 'value': '1200V600A'}
-        ]
-    }
-    options = power_options.get(selected_product, [])
-    print(f"Updated POWER options: {options}")  # 調試輸出
-    return options
 
-# 根據 POWER 更新 DEVICE TYPE 選項
+# 定義 Diagrams3 頁面的佈局（整合 diagrams3 的內容）
+# 定義回調函數：Diagrams3 的功能
+callbacks_diagrams3(app)
+
+# 定義回調函數：根據 URL 顯示對應的頁面
 @app.callback(
-    Output('device-type-dropdown', 'options'),
-    Input('category2-dropdown', 'value')
+    Output('page-content', 'children'),
+    [Input('url', 'pathname')]
 )
-def update_device_type_options(selected_power):
-    print(f"Selected POWER: {selected_power}")  # 調試輸出
-    if selected_power:
-        device_options = [
-            {'label': 'IGBT', 'value': 'IGBT'},
-            {'label': 'Diode', 'value': 'Diode'},
-            {'label': 'ROSBA', 'value': 'ROSBA'},
-            {'label': 'NTC', 'value': 'NTC'}
-        ]
-        print(f"Updated DEVICE TYPE options: {device_options}")  # 調試輸出
-        return device_options
-    else:
-        print("No POWER selected.")  # 調試輸出
-        return []
 
-# 根據 DEVICE TYPE 更新 PROPERTY 選項的回調函數
+def display_page(pathname):
+    if pathname.startswith('/details/'):
+        # 提取 Type Name
+        type_name = pathname.split('/details/')[1]
+        # 這裡可以根據 Type Name 顯示詳細頁面
+        return dbc.Container([
+            html.H2(f"Details for {type_name}", className="mt-4"),
+            html.P(f"這是 {type_name} 的詳細頁面。"),
+            dcc.Link("返回首頁", href='/')
+        ], fluid=True)
+    elif pathname == '/diagrams1':
+        return diagrams1_layout
+    elif pathname == '/diagrams2':
+        return diagrams2_layout
+    elif pathname == '/diagrams3':
+        return diagrams3_layout  # 顯示 Diagrams3 頁面
+    elif pathname == '/contact':
+        return contact_layout
+    else:
+        return home_layout
+
+# 定義回調函數：根據選擇過濾並更新 AgGrid 的 rowData
 @app.callback(
-    [Output('property-dropdown', 'options'),
-     Output('property-dropdown', 'disabled')],
-    Input('device-type-dropdown', 'value')
+    Output("grid", "rowData"),
+    Output("store-selected", "data"),
+    Output("no-data-message", "children"),
+    Input("module-dropdown", "value"),
+    Input("year-radio", "value"),
+    Input("power-dropdown", "value"),
 )
-def update_property_options(selected_device_type):
-    print(f"Selected DEVICE TYPE: {selected_device_type}")  # 調試輸出
-    if selected_device_type == 'IGBT':
-        property_options = [
-            {'label': 'IC, VCE', 'value': 'IC_VCE'},
-            {'label': 'IF, VF', 'value': 'IF_VF'},
-            {'label': 'Eon, Eoff (IC)', 'value': 'Eon_Eoff_IC'},
-            {'label': 'Eon, Eoff (RG)', 'value': 'Eon_Eoff_RG'},
-            {'label': 'Erec (RG)', 'value': 'Erec_RG'},
-            {'label': 'VGE, QG', 'value': 'VGE_QG'},
-            {'label': 'Zth, Tp', 'value': 'Zth_Tp'}
-        ]
-    elif selected_device_type == 'Diode':
-        property_options = [
-            {'label': 'IV, VF', 'value': 'IV_VF'},
-            {'label': 'EREC (IC)', 'value': 'EREC_IC'},
-            {'label': 'EREC (RG)', 'value': 'EREC_RG'},
-            {'label': 'Zth, TP', 'value': 'Zth_TP'}
-        ]
-    elif selected_device_type == 'ROSBA':
-        property_options = [
-            {'label': 'ROSBA', 'value': 'ROSBA'}
-        ]
-    elif selected_device_type == 'NTC':
-        property_options = [
-            {'label': 'NTC', 'value': 'NTC'}
-        ]
+def update_grid(selected_module, selected_year, selected_power):
+    print(f"選擇的模組: {selected_module}, 年份: {selected_year}, Power: {selected_power}")
+
+    # 過濾條件
+    filter_conditions = (df['Report Year'] == selected_year)
+
+    if selected_module != 'All':
+        filter_conditions &= (df["Module"] == selected_module)
+
+    if selected_power != 'All':
+        selected_power_str = str(selected_power).strip()
+        df["Power"] = df["Power"].astype(str).str.strip()
+        filter_conditions &= (df["Power"] == selected_power_str)
+
+    # 過濾資料
+    filtered_df = df[filter_conditions].copy()
+
+    # 如果需要按照 Power 數值排序（假設 'Power' 是以數字加 'V' 表示，如 '123V'）
+    if not filtered_df.empty:
+        filtered_df['Power_num'] = filtered_df['Power'].str.extract(r'(\d+)V', expand=False).astype(float)
+        filtered_df['Power_num'] = filtered_df['Power_num'].fillna(float('inf'))
+        filtered_df = filtered_df.sort_values(by='Power_num', ascending=True)
+        filtered_df = filtered_df.drop(columns=['Power_num'])
+
+    # 將 DataFrame 轉換為字典列表
+    records = filtered_df.fillna('').to_dict("records")
+
+    if not records:
+        no_data_message = "沒有符合條件的資料。"
     else:
-        property_options = []
+        no_data_message = ""
 
-    if property_options:
-        print(f"Updated PROPERTY options: {property_options}")  # 調試輸出
-        return property_options, False
-    else:
-        print("No DEVICE TYPE selected.")  # 調試輸出
-        return [], True
+    store_data = records[:1] if records else []
 
-# 根據 property-dropdown 更新主要卡片區域
+    return records, store_data, no_data_message
 
-
+# 定義回調函數：生成柱狀圖
 @app.callback(
-    Output('cards-container', 'children'),
-    Input('property-dropdown', 'value')
+    Output("bar-chart-card", "children"),
+    Input("store-selected", "data")
 )
-def update_cards(selected_property):
-    print(f"Selected PROPERTY: {selected_property}")  # 調試輸出
-    if selected_property == 'IF_VF':
-        print("Displaying create_loss_analysis_card3")  # 調試輸出
-        return dbc.Row([
-            dbc.Col(
-                create_loss_analysis_card3(),
-                md=5,
-                className='mb-4'
-            )
-        ], justify="center")  # 置中對齊
-    elif selected_property == 'Eon_Eoff_IC':
-            print("Displaying create_loss_analysis_card4")  # 調試輸出
-            return dbc.Row([
-                dbc.Col(
-                    create_loss_analysis_card4(),
-                    md=5,
-                    className='mb-4'
-                )
-            ], justify="center")  # 置中對齊
-    elif selected_property == 'Eon_Eoff_RG':
-            print("Displaying create_loss_analysis_card5")  # 調試輸出
-            return dbc.Row([
-                dbc.Col(
-                    create_loss_analysis_card5(),
-                    md=5,
-                    className='mb-4'
-                )
-            ], justify="center")  # 置中對齊
-    elif selected_property == 'Erec_RG':
-            print("Displaying create_loss_analysis_card6")  # 調試輸出
-            return dbc.Row([
-                dbc.Col(
-                    create_loss_analysis_card6(),
-                    md=5,
-                    className='mb-4'
-                )
-            ], justify="center")  # 置中對齊
-    elif selected_property == 'VGE_QG':
-            print("Displaying create_loss_analysis_card7")  # 調試輸出
-            return dbc.Row([
-                dbc.Col(
-                    create_loss_analysis_card7(),
-                    md=5,
-                    className='mb-4'
-                )
-            ], justify="center")  # 置中對齊
-    elif selected_property == 'Zth_Tp':
-            print("Displaying create_loss_analysis_card8")  # 調試輸出Card_8
-            return dbc.Row([
-                dbc.Col(
-                    create_loss_analysis_card8(),
-                    md=5,
-                    className='mb-4'
-                )
-            ], justify="center")  # 置中對齊Zth_Tp
+def make_bar_chart(data):
+    if not data:
+        fig = {}
     else:
-        print("Displaying create_loss_analysis_card and create_loss_analysis_card2")  # 調試輸出
-        return dbc.Row([
-            dbc.Col(
-                create_loss_analysis_card(),
-                md=5,
-                className='mb-4'
+        data = data[0]
+        quarters = ['Q1', 'Q2', 'Q3', 'Q4']
+        male_percentages = [data.get(f'{q} Male', 0) for q in quarters]
+        female_percentages = [data.get(f'{q} Female', 0) for q in quarters]
+
+        quarter_labels = {
+            'Q1': 'Lower (Q1)',
+            'Q2': 'Lower Middle (Q2)',
+            'Q3': 'Upper Middle (Q3)',
+            'Q4': 'Upper (Q4)'
+        }
+        custom_labels = [quarter_labels[q] for q in quarters]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            y=custom_labels,
+            x=male_percentages,
+            name='Male',
+            orientation='h',
+            marker=dict(color='#19A0AA'),
+            text=male_percentages,
+            textfont_size=14,
+            textposition='inside',
+        ))
+
+        fig.add_trace(go.Bar(
+            y=custom_labels,
+            x=female_percentages,
+            name='Female',
+            orientation='h',
+            marker=dict(color='#F15F36'),
+            text=female_percentages,
+            textfont_size=14,
+            textposition='inside',
+        ))
+
+        fig.update_layout(
+            xaxis=dict(ticksuffix='%'),
+            yaxis=dict(title='Quartile', categoryorder='array', categoryarray=quarters),
+            barmode='stack',
+            template='plotly_white',
+            legend=dict(
+                orientation='h',
+                yanchor='bottom',
+                y=-0.25,
+                xanchor='center',
+                x=0.5,
+                traceorder='normal'
             ),
-            dbc.Col(
-                create_loss_analysis_card2(),
-                md=5,
-                className='mb-4'
-            )
-        ], justify="center")  # 置中對齊
+            margin=dict(l=10, r=10, t=10, b=10),
+        )
 
+    return dbc.Card([
+        dbc.CardHeader(html.H2("Analyze"), className="text-center"),
+        dcc.Graph(figure=fig, style={"height": 250}, config={'displayModeBar': False})
+    ])
 
-
-
-
-
- # 750V820AZTH_IGBT_M,create_loss_analysis_card8(),update_loss_analysis8()
+# 定義回調函數：處理 Type Name 的點擊事件
 @app.callback(
-    [Output('zth-graph8', 'figure'),
-     Output('zth-table8', 'data'),
-     Output('zth-table8', 'columns')],
-    [Input('zth-radio8', 'value'),
-     Input('zth-time-slider8', 'value')]
+    Output('url', 'pathname'),  # 使用 pathname 來導航
+    Input('datasheet-table', 'active_cell'),
+    State('datasheet-table', 'data'),
 )
-def update_loss_analysis8(selected_radio, time_range):
-    """
-    根據 selected_radio (ZTH_IGBT / ZTH_DIODE 等) 與 time_range
-    更新圖表與表格
-    """
-    df = load_data_zth(DATA_FILE_PATH8)
-    if df.empty:
-        # 回傳空圖
-        return go.Figure(), [], []
+def navigate_on_click(active_cell, data):
+    if active_cell:
+        row = active_cell['row']
+        column = active_cell['column_id']
+        if column == 'Type Name':
+            # 提取 Type Name（移除前綴的圖示 Markdown）
+            type_name = re.sub(r'^!\[icon\]\(/assets/inbox-document-text\.png\)\s+', '', data[row]['Type Name'])
+            # 定義要導航到的 URL，這裡以 '/details/{Type Name}' 為例，您可以更改為實際的連結
+            target_path = f"/details/{type_name}"
+            return target_path
+    return dash.no_update
 
-    # 1) 篩選資料：根據 time_range
-    #   time_range 可能是 [-6, 1] 代表要顯示 1e-6 ~ 1e1 之間
-    t_min = 10**(time_range[0])  # 例如 1e-6
-    t_max = 10**(time_range[1])  # 例如 1e1
-    df_filtered = df[(df['t [s]'] >= t_min) & (df['t [s]'] <= t_max)]
+# 定義回調函數：切換各個 Collapse 的顯示狀態
+@app.callback(
+    [
+        Output("collapse-datasheet", "is_open"),
+        Output("collapse-visualization", "is_open"),
+        Output("collapse-diagrams", "is_open"),
+        Output("collapse-benchmarking", "is_open"),
+    ],
+    [
+        Input("collapse-datasheet-button", "n_clicks"),
+        Input("collapse-visualization-button", "n_clicks"),
+        Input("collapse-diagrams-button", "n_clicks"),
+        Input("collapse-benchmarking-button", "n_clicks"),
+    ],
+    [
+        State("collapse-datasheet", "is_open"),
+        State("collapse-visualization", "is_open"),
+        State("collapse-diagrams", "is_open"),
+        State("collapse-benchmarking", "is_open"),
+    ],
+)
+def toggle_collapse(n_datasets, n_visualization, n_diagrams, n_benchmarking,
+                   is_open_datasets, is_open_visualization, is_open_diagrams, is_open_benchmarking):
+    ctx = dash.callback_context
 
-    # 2) 繪製圖表
+    if not ctx.triggered:
+        return False, False, False, False
+    else:
+        button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    if button_id == "collapse-datasheet-button":
+        return not is_open_datasets, is_open_visualization, is_open_diagrams, is_open_benchmarking
+    elif button_id == "collapse-visualization-button":
+        return is_open_datasets, not is_open_visualization, is_open_diagrams, is_open_benchmarking
+    elif button_id == "collapse-diagrams-button":
+        return is_open_datasets, is_open_visualization, not is_open_diagrams, is_open_benchmarking
+    elif button_id == "collapse-benchmarking-button":
+        return is_open_datasets, is_open_visualization, is_open_diagrams, not is_open_benchmarking
+    return False, False, False, False
+
+# ================== Diagrams1 的整合開始 ==================
+
+# 回調函數：A 卡片
+@app.callback(
+    Output('graph-tj25', 'figure'),
+    Input('upload-tj25', 'contents'),
+    State('upload-tj25', 'filename')
+)
+def update_graph_a(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or len(df.columns) < 2:
+        return go.Figure()
+
     fig = go.Figure()
-    # 假設要畫 「t [s]」 vs 「Zth(t)」
+
+    # 確保 CSV 欄位名稱對應正確
+    temperatures = {
+        'Tj = 25℃': {'ic_col': 'IC_Tj = 25℃', 'vce_col': 'VCE_Tj = 25℃', 'dash': 'solid'},
+        'Tj = 150℃': {'ic_col': 'IC_Tj = 150℃', 'vce_col': 'VCE_Tj = 150℃', 'dash': 'dash'},
+        'Tj = 175℃': {'ic_col': 'IC_Tj = 175℃', 'vce_col': 'VCE_Tj = 175℃', 'dash': 'dashdot'}
+    }
+
+    # 檢查 CSV 是否包含這些欄位，並添加曲線
+    for temp, params in temperatures.items():
+        ic_col = params['ic_col']
+        vce_col = params['vce_col']
+
+        if ic_col in df.columns and vce_col in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df[vce_col], y=df[ic_col],
+                mode='lines',
+                name=temp,
+                line=dict(color='black', dash=params['dash'])  # 設定線型
+            ))
+        else:
+            print(f"❌ 缺少欄位: {ic_col} 或 {vce_col}")
+
+    # 設定圖例位置到左上角
+    fig.update_layout(
+        title="Static",
+        xaxis_title="V<sub>CE</sub> (V)",
+        yaxis_title="I<sub>C</sub> (A)",
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(
+            x=0.01,  # 左上角對齊
+            y=0.99,  # 靠近頂部
+            bgcolor="white",
+            bordercolor="black",
+            borderwidth=2
+        ),
+        plot_bgcolor="white",
+
+        # 設定 X 軸範圍、刻度 & 框線
+        xaxis=dict(
+            range=[0, 3.0],  # 設定範圍 0 ~ 3.0
+            tickvals=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0],  # 設定刻度
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True,  # 設定四周框線
+            showline=True, linewidth=1, linecolor='black'
+        ),
+
+        # 設定 Y 軸範圍、刻度 & 框線
+        yaxis=dict(
+            range=[0, 1600],  # 設定範圍 0 ~ 1600
+            tickvals=[0, 200, 400, 600, 800, 1000, 1200, 1400, 1600],  # 設定刻度
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True,  # 設定四周框線
+            showline=True, linewidth=1, linecolor='black'
+        ),
+    )
+
+    return fig
+
+
+
+# 回調函數：B 卡片
+@app.callback(
+    Output('graph-tj150', 'figure'),
+    Input('upload-tj150', 'contents'),
+    State('upload-tj150', 'filename')
+)
+def update_graph_b(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or len(df.columns) < 2:
+        return go.Figure()
+
+    fig = go.Figure()
+
+    # 確保 CSV 欄位名稱對應正確
+    voltages = {
+        'VGE = 9V': {'ic_col': 'IC_9V', 'vce_col': 'VCE_9V', 'dash': 'solid'},
+        'VGE = 11V': {'ic_col': 'IC_11V', 'vce_col': 'VCE_11V', 'dash': 'dash'},
+        'VGE = 13V': {'ic_col': 'IC_13V', 'vce_col': 'VCE_13V', 'dash': 'dot'},
+        'VGE = 15V': {'ic_col': 'IC_15V', 'vce_col': 'VCE_15V', 'dash': 'dashdot'},
+        'VGE = 17V': {'ic_col': 'IC_17V', 'vce_col': 'VCE_17V', 'dash': 'longdash'},
+        'VGE = 19V': {'ic_col': 'IC_19V', 'vce_col': 'VCE_19V', 'dash': 'longdashdot'}
+    }
+
+    # 檢查 CSV 是否包含欄位，生成曲線
+    for vge, params in voltages.items():
+        ic_col = params['ic_col']
+        vce_col = params['vce_col']
+
+        if ic_col in df.columns and vce_col in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df[vce_col], y=df[ic_col],
+                mode='lines',
+                name=vge,
+                line=dict(color='black', dash=params['dash'])  # 設定線型
+            ))
+        else:
+            print(f"❌ 缺少欄位: {ic_col} 或 {vce_col}")
+
+    # 設定圖例位置到左上角
+    fig.update_layout(
+        title="Static",
+        xaxis_title="V<sub>CE</sub> (V)",
+        yaxis_title="I<sub>C</sub> (A)",
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(
+            x=0.01,  # 左上角對齊
+            y=0.99,  # 靠近頂部
+            bgcolor="white",
+            bordercolor="black",
+            borderwidth=2
+        ),
+        plot_bgcolor="white",
+
+        # 設定 X 軸範圍、刻度 & 框線
+        xaxis=dict(
+            range=[0, 3.5],  # 設定範圍 0 ~ 3.5
+            tickvals=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],  # 設定刻度
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True,  # 設定四周框線
+            showline=True, linewidth=1, linecolor='black'
+        ),
+
+        # 設定 Y 軸範圍、刻度 & 框線
+        yaxis=dict(
+            range=[0, 1600],  # 設定範圍 0 ~ 1600
+            tickvals=[0, 200, 400, 600, 800, 1000, 1200, 1400, 1600],  # 設定刻度
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True,  # 設定四周框線
+            showline=True, linewidth=1, linecolor='black'
+        ),
+    )
+
+    return fig
+
+
+
+# 回調函數：C 卡片
+@app.callback(
+    Output('graph-tj175', 'figure'),
+    Input('upload-tj175', 'contents'),
+    State('upload-tj175', 'filename')
+)
+def update_graph_c(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or len(df.columns) < 2:
+        return go.Figure()
+
+    fig = go.Figure()
+
+    # CSV 欄位名稱對應正確
+    voltages = {
+        'VGE = 9V': {'ic_col': 'IC_9V', 'vce_col': 'VCE_9V', 'dash': 'solid'},
+        'VGE = 11V': {'ic_col': 'IC_11V', 'vce_col': 'VCE_11V', 'dash': 'dash'},
+        'VGE = 13V': {'ic_col': 'IC_13V', 'vce_col': 'VCE_13V', 'dash': 'dot'},
+        'VGE = 15V': {'ic_col': 'IC_15V', 'vce_col': 'VCE_15V', 'dash': 'dashdot'},
+        'VGE = 17V': {'ic_col': 'IC_17V', 'vce_col': 'VCE_17V', 'dash': 'longdash'},
+        'VGE = 19V': {'ic_col': 'IC_19V', 'vce_col': 'VCE_19V', 'dash': 'longdashdot'}
+    }
+
+    # 檢查 CSV 是否包含這些欄位，並添加曲線
+    for vge, params in voltages.items():
+        ic_col = params['ic_col']
+        vce_col = params['vce_col']
+
+        if ic_col in df.columns and vce_col in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df[vce_col], y=df[ic_col],
+                mode='lines',
+                name=vge,
+                line=dict(color='black', dash=params['dash'])  # 設定線型
+            ))
+        else:
+            print(f"❌ 缺少欄位: {ic_col} 或 {vce_col}")
+
+    # 設定圖例位置到左上角
+    fig.update_layout(
+        title="Static",
+        xaxis_title="V<sub>CE</sub> (V)",
+        yaxis_title="I<sub>C</sub> (A)",
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(
+            x=0.01,  # 左上角對齊
+            y=0.99,  # 靠近頂部
+            bgcolor="white",
+            bordercolor="black",
+            borderwidth=2
+        ),
+        plot_bgcolor="white",
+
+        # 設定 X 軸範圍、刻度 & 框線
+        xaxis=dict(
+            range=[0, 3.5],  # 設定範圍 0 ~ 3.5
+            tickvals=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],  # 設定刻度
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True,  # 設定四周框線
+            showline=True, linewidth=1, linecolor='black'
+        ),
+
+        # 設定 Y 軸範圍、刻度 & 框線
+        yaxis=dict(
+            range=[0, 1600],  # 設定範圍 0 ~ 1600
+            tickvals=[0, 200, 400, 600, 800, 1000, 1200, 1400, 1600],  # 設定刻度
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True,  # 設定四周框線
+            showline=True, linewidth=1, linecolor='black'
+        ),
+    )
+
+    return fig
+
+
+
+# 回調函數：D 卡片
+@app.callback(
+    Output('graph-tjD', 'figure'),
+    Input('upload-tjD', 'contents'),
+    State('upload-tjD', 'filename')
+)
+def update_graph_d(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or len(df.columns) < 2:
+        return go.Figure()
+
+    fig = go.Figure()
+
+    # 設定三條線的樣式
+    conditions = {
+        'Tj = 25℃': {'if_col': 'If_25℃', 'vf_col': 'Vf_25℃', 'dash': 'solid'},
+        'Tj = 150℃': {'if_col': 'If_150℃', 'vf_col': 'Vf_150℃', 'dash': 'dash'},
+        'Tj = 175℃': {'if_col': 'If_175℃', 'vf_col': 'Vf_175℃', 'dash': 'dashdot'}
+    }
+
+    for condition, params in conditions.items():
+        if_col = params['if_col']
+        vf_col = params['vf_col']
+
+        if if_col in df.columns and vf_col in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df[vf_col], y=df[if_col],
+                mode='lines',
+                name=condition,
+                line=dict(color='black', dash=params['dash'])  # 設定線型
+            ))
+
+    # 設定圖例位置到左上角
+    fig.update_layout(
+        title="Static",
+        xaxis_title="V<sub>F</sub> (V)",
+        yaxis_title="I<sub>F</sub> (A)",
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(
+            x=0.01,  # 左上角對齊
+            y=0.99,  # 靠近頂部
+            bgcolor="white",
+            bordercolor="black",
+            borderwidth=2
+        ),
+        plot_bgcolor="white",
+
+        # 設定 X 軸範圍、刻度 & 框線
+        xaxis=dict(
+            range=[0, 3.5],  # 設定範圍 0 ~ 3.5
+            tickvals=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],  # 設定刻度
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True,  # 設定四周框線
+            showline=True, linewidth=1, linecolor='black'
+        ),
+
+        # 設定 Y 軸範圍、刻度 & 框線
+        yaxis=dict(
+            range=[0, 1600],  # 設定範圍 0 ~ 1600
+            tickvals=[0, 200, 400, 600, 800, 1000, 1200, 1400, 1600],  # 設定刻度
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True,  # 設定四周框線
+            showline=True, linewidth=1, linecolor='black'
+        ),
+    )
+
+    return fig
+
+
+
+# E 卡片的回調函數
+@app.callback(
+    Output('graph-tjE', 'figure'),
+    Input('upload-tjE', 'contents'),
+    State('upload-tjE', 'filename')
+)
+def update_graph_e(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or len(df.columns) < 2:
+        return go.Figure()
+
+    fig = go.Figure()
+
+    # 定義 6 條不同的曲線對應的 Eon/Eoff
+    line_styles = {
+        #'Eon_25℃': {'ic_col': 'IC(A)_25℃', 'e_col': 'Eon(mJ)_25℃', 'dash': 'solid'},
+        #'Eoff_25℃': {'ic_col': 'IC(A)_25℃', 'e_col': 'Eoff(mJ)_25℃', 'dash': 'dash'},
+        'Eon_150℃': {'ic_col': 'IC(A)_150℃', 'e_col': 'Eon(mJ)_150℃', 'dash': 'dot'},
+        'Eoff_150℃': {'ic_col': 'IC(A)_150℃', 'e_col': 'Eoff(mJ)_150℃', 'dash': 'dashdot'},
+        'Eon_175℃': {'ic_col': 'IC(A)_175℃', 'e_col': 'Eon(mJ)_175℃', 'dash': 'longdash'},
+        'Eoff_175℃': {'ic_col': 'IC(A)_175℃', 'e_col': 'Eoff(mJ)_175℃', 'dash': 'longdashdot'}
+    }
+
+    # 依序添加線條
+    for name, params in line_styles.items():
+        ic_col = params['ic_col']
+        e_col = params['e_col']
+
+        if ic_col in df.columns and e_col in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df[ic_col], y=df[e_col],
+                mode='lines',
+                name=name,
+                line=dict(color='black', dash=params['dash'])
+            ))
+
+    # 加入 X 軸與 Y 軸的 0 軸線
+    zero_line_shapes = [
+        dict(type='line', x0=0, x1=0, y0=0, y1=1, xref='x', yref='paper', line=dict(color='black', width=1)),
+        dict(type='line', x0=0, x1=1, y0=0, y1=0, xref='paper', yref='y', line=dict(color='black', width=1))
+    ]
+
+    # 設定 X 軸與 Y 軸範圍，符合圖片設定
+    fig.update_layout(
+        title="Switching Losses vs IC(A)",
+        xaxis_title="I<sub>C</sub>(A)",
+        yaxis_title="E (mJ)",
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(
+            x=0.01,  # 左上角對齊
+            y=0.99,  # 靠近頂部
+            bgcolor="white",
+            bordercolor="black",
+            borderwidth=2
+        ),
+        plot_bgcolor="white",
+        xaxis=dict(
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black',
+            range=[0, 1400], tickvals=list(range(0, 1401, 200)),
+            mirror=True, showline=True, linewidth=1, linecolor='black'  # 四周黑色框線
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black',
+            range=[0, 140], tickvals=list(range(0, 141, 20)),
+            mirror=True, showline=True, linewidth=1, linecolor='black'  # 四周黑色框線
+        ),
+        shapes=zero_line_shapes  # 加入 0 軸線
+    )
+
+    return fig
+
+
+# F 卡片的回調函數
+@app.callback(
+    Output('graph-tjF', 'figure'),
+    Input('upload-tjF', 'contents'),
+    State('upload-tjF', 'filename')
+)
+def update_graph_f(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or len(df.columns) < 2:
+        return go.Figure()
+
+    fig = go.Figure()
+
+    # 定義 6 條不同的曲線對應的 Eon/Eoff
+    line_styles = {
+        #'Eon_25℃': {'rg_col': 'RG_25℃', 'e_col': 'Eon(mJ)_25℃', 'dash': 'solid'},
+        #'Eoff_25℃': {'rg_col': 'RG_25℃', 'e_col': 'Eoff(mJ)_25℃', 'dash': 'dash'},
+        'Eon_150℃': {'rg_col': 'RG_150℃', 'e_col': 'Eon(mJ)_150℃', 'dash': 'dot'},
+        'Eoff_150℃': {'rg_col': 'RG_150℃', 'e_col': 'Eoff(mJ)_150℃', 'dash': 'dashdot'},
+        'Eon_175℃': {'rg_col': 'RG_175℃', 'e_col': 'Eon(mJ)_175℃', 'dash': 'longdash'},
+        'Eoff_175℃': {'rg_col': 'RG_175℃', 'e_col': 'Eoff(mJ)_175℃', 'dash': 'longdashdot'}
+    }
+
+    # 依序添加線條
+    for name, params in line_styles.items():
+        rg_col = params['rg_col']
+        e_col = params['e_col']
+
+        if rg_col in df.columns and e_col in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df[rg_col], y=df[e_col],
+                mode='lines',
+                name=name,
+                line=dict(color='black', dash=params['dash'])
+            ))
+
+    # 加入 X 軸與 Y 軸的 0 軸線
+    zero_line_shapes = [
+        dict(type='line', x0=0, x1=0, y0=0, y1=1, xref='x', yref='paper', line=dict(color='black', width=1)),
+        dict(type='line', x0=0, x1=1, y0=0, y1=0, xref='paper', yref='y', line=dict(color='black', width=1))
+    ]
+
+    # 設定 X 軸與 Y 軸範圍，符合圖片設定
+    fig.update_layout(
+        title="Switching Losses vs RG",
+        xaxis_title="R<sub>G</sub> (Ω)",
+        yaxis_title="E (mJ)",
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(
+            x=0.01,  # 左上角對齊
+            y=0.99,  # 靠近頂部
+            bgcolor="white",
+            bordercolor="black",
+            borderwidth=2
+        ),
+        plot_bgcolor="white",
+        xaxis=dict(
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black',
+            range=[0, 25], tickvals=list(range(0, 26, 2)),
+            mirror=True, showline=True, linewidth=1, linecolor='black'  # 四周黑色框線
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor='lightgray',
+            zeroline=True, zerolinecolor='black',
+            range=[0, 120], tickvals=list(range(0, 121, 20)),
+            mirror=True, showline=True, linewidth=1, linecolor='black'  # 四周黑色框線
+        ),
+        shapes=zero_line_shapes  # 加入 0 軸線
+    )
+
+    return fig
+
+# 回調函數：G 卡片
+@app.callback(
+    Output('graph-tjG', 'figure'),
+    Input('upload-tjG', 'contents'),
+    State('upload-tjG', 'filename')
+)
+def update_graph_g(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or not {'VCE', 'Cies', 'Coes', 'Cres'}.issubset(df.columns):
+        return go.Figure()
+
+    fig = go.Figure()
+
+    # 添加三條不同線型的曲線
     fig.add_trace(go.Scatter(
-        x=df_filtered['t [s]'],
-        y=df_filtered['Zth (t)'],
-        mode='lines+markers',
-        name='Zth'
+        x=df['VCE'], y=df['Cies'],
+        mode='lines', name='Cies',
+        line=dict(color='black', width=2, dash='solid')  # 實線
     ))
-    # 可視情況繪製其它曲線 (如 ΔTj(t))
 
+    fig.add_trace(go.Scatter(
+        x=df['VCE'], y=df['Coes'],
+        mode='lines', name='Coes',
+        line=dict(color='black', width=2, dash='dash')  # 虛線
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=df['VCE'], y=df['Cres'],
+        mode='lines', name='Cres',
+        line=dict(color='black', width=2, dash='dashdot')  # 點畫線
+    ))
+
+    # 設定圖表格式，確保與圖片一致
     fig.update_layout(
-        title=f"Zth vs Time ({selected_radio})",
-        xaxis_type='log',
-        yaxis_type='log',
-        xaxis_title="Time t [s]",
-        yaxis_title="Zth (K/W)",
-        template='plotly_white',
-        legend=dict(
-            x=1,
-            y=0.99,
-            bgcolor='rgba(255,255,255,0)'
-        )
+        title="Dynamic Capacitance Characteristics",
+        xaxis_title="V<sub>CE</sub> (V)",
+        yaxis_title="C (nF)",
+        margin=dict(l=40, r=20, t=30, b=40),
+        legend_title="Conditions",
+        plot_bgcolor="white",
+        font=dict(size=12),
+        xaxis=dict(
+            showgrid=True, gridcolor='lightgray', gridwidth=0.5,
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True, linecolor="black", linewidth=1,
+            ticks="inside", ticklen=5,
+            range=[0, 800], tickvals=list(range(0, 801, 100))
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor='lightgray', gridwidth=0.5,
+            zeroline=True, zerolinecolor='black', zerolinewidth=1,
+            mirror=True, linecolor="black", linewidth=1,
+            ticks="inside", ticklen=5,
+            type='log', range=[-1, 2],
+            tickvals=[0.1, 1, 10, 100], tickmode='array'
+        ),
+        legend=dict(bordercolor="black", borderwidth=1),
     )
 
-    # 3) 準備表格資料
-    #   依需求挑欄位顯示
-    columns = [
-        {"name": "t [s]", "id": "t [s]"},
-        {"name": "Zth (t)", "id": "Zth (t)"},
-        {"name": "ΔTj (t)", "id": "ΔTj (t)"},
-        # 也可自行增減
-    ]
-    # 要先確認 df_filtered 中是否含有這些欄位
-    table_data = df_filtered.to_dict('records')
-
-    return fig, table_data, columns
+    return fig
 
 
-#++++
- # 750V820AGATECHARGE_L,create_loss_analysis_card7(),update_loss_analysis7()
+# 回調函數：H 卡片
 @app.callback(
-    [Output('loss_loss-graph7', 'figure'),
-     Output('loss_loss-table7', 'data'),
-     Output('loss_loss-table7', 'columns')],
-    [Input('loss_temperature-dropdown-graph7', 'value'),
-     Input('loss_ic-range-slider7', 'value'),
-     Input('loss_vce-range-slider7', 'value'),
-     Input('loss_temperature-dropdown-table7', 'value')]
+    Output('graph-extra1', 'figure'),
+    Input('upload-extra1', 'contents'),
+    State('upload-extra1', 'filename')
 )
-def update_loss_analysis7(selected_temp_graph, ic_range, vce_range, selected_temp_table):
-    print(f"update_loss_analysis7 triggered with: selected_temp_graph={selected_temp_graph}, QG_range={ic_range}, VCE_range={vce_range}, selected_temp_table={selected_temp_table}")
+def update_graph_h(contents, filename):
+    if contents is None:
+        return go.Figure()
 
-    df = load_data(DATA_FILE_PATH7)
-    if df.empty:
-        print("DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "QG (μC)", "id": "QG (μC)"},
-            {"name": "VCE (V)", "id": "VCE (V)"},
+    # 解析上傳的數據
+    df = parse_contents(contents, filename)
+    if df is None:
+        return go.Figure()
 
-        ]
-        return empty_fig, empty_data, empty_columns
+    # 檢查必要的欄位是否存在
+    expected_columns = {'TNTC(℃)', 'R(Ω)'}
+    if not expected_columns.issubset(df.columns):
+        print("數據缺少必要的欄位:", expected_columns)
+        return go.Figure()
 
-    # 過濾數據中的負值
-    df_filtered = df
-    print("U4-2305.")  # 調試輸出
-    # 假設 DATA_FILE_PATH 包含 Tj = 25°C, 150°C, 175°C 的數據
-    conditions = []
-    #for temp in ['25℃', '150℃', '175℃']:
-    for temp in ['25℃']:
-        qg_col = f'VGE(V)_{temp}'
-        print(f"U4 qg_col: {qg_col}")
-        vce_col = f'QG(μC)_{temp}'  # Eon card6
-        print(f"U4 Vce_col: {vce_col}")
-        #vce_col2 = f'Eoff(mJ)_{temp}'  # Eoff card6
-        #print(f"U4 Eoff_col: {vce_col2}")
-    if qg_col in df_filtered.columns and vce_col in df_filtered.columns:
-            conditions.append(
-                (df_filtered[qg_col] >= ic_range[0]) & (df_filtered[qg_col] <= ic_range[1]) &
-                (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1])
-                #(df_filtered[vce_col2] >= vce_range[0]) & (df_filtered[vce_col2] <= vce_range[1])
-    )
-
-    if selected_temp_graph == 'ifvf_all_temperatures':
-        # 對所有溫度進行過濾
-        combined_condition = False
-        for condition in conditions:
-            combined_condition |= condition
-        df_filtered = df_filtered[combined_condition]
-        print(f"Filtered DataFrame for ifvf_all_temperatures: {df_filtered.shape[0]} rows.")  # 調試輸出
-    else:
-        temp_key = selected_temp_graph  # e.g., 'Tj_25C_IC_f_VCE'
-
-        # 從 temp_key 中提取溫度
-        temp_parts = temp_key.split('_')
-        if len(temp_parts) >= 3:
-            temp_str = temp_parts[1]  # '25C'
-            temp_str = temp_str.replace('C', '℃')  # '25℃'
-            QG_col = f'QG(μC)_{temp_str}'
-            VGE_col = f'VGE(V)_{temp_str}'
-            # vce_col2 = f'Eoff(mJ)_{temp_str}'
-            # if qg_col in df_filtered.columns and QG_col in df_filtered.columns and VGE_col1 in df_filtered.columns:
-            if VGE_col in df_filtered.columns and QG_col in df_filtered.columns:
-                df_filtered = df_filtered[
-                    (df_filtered[QG_col] >= ic_range[0]) & (df_filtered[QG_col] <= ic_range[1]) &
-                    (df_filtered[VGE_col] >= vce_range[0]) & (df_filtered[VGE_col] <= vce_range[1])
-                    # (df_filtered[vce_col2] >= vce_range[0]) & (df_filtered[vce_col2] <= vce_range[1])
-                    ]
-                print(f"Filtered DataFrame for {temp_key}: {df_filtered.shape[0]} rows.")  # 調試輸出
-            else:
-                print(f"Columns {QG_col} and/or {VGE_col} not found in DataFrame.")  # 調試輸出
-                df_filtered = pd.DataFrame()  # 清空 DataFrame
-        else:
-            print(f"Unexpected temp_key format: {temp_key}")  # 調試輸出
-            df_filtered = pd.DataFrame()  # 清空 DataFrame
-
-    if df_filtered.empty:
-        print("Filtered DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "QG (μC)", "id": "QG (μC)"},
-            {"name": "VGE (V)", "id": "VGE (V)"}
-            #{"name": "VCE2 (V)", "id": "VCE2 (V)"}
-        ]
-        return empty_fig, empty_data, empty_columns
-
-    # 初始化圖表
+    # 創建圖表
     fig = go.Figure()
 
-    # 整理數據
-    temperature_data = {
-        'Tj_25C_IC_f_VCE': {
-            'IC': df_filtered['QG(μC)_25℃'].tolist(),
-            'VCE': df_filtered['VGE(V)_25℃'].tolist(),
-            #'VCE2': df_filtered['Eoff(mJ)_25℃'].tolist(),
-            'Temperature': ['Tj = 25℃'] * len(df_filtered)
-        },
-        'Tj_150C_IC_f_VCE': {
-            'IC': df_filtered['QG(μC)_25℃'].tolist(),
-            'VCE': df_filtered['VGE(V)_25℃'].tolist(),
-            #'VCE2': df_filtered['Eoff(mJ)_150℃'].tolist(),
-            'Temperature': ['Tj = 150℃'] * len(df_filtered)
-        },
-        'Tj_175C_IC_f_VCE': {
-            'IC': df_filtered['QG(μC)_25℃'].tolist(),
-            'VCE': df_filtered['VGE(V)_25℃'].tolist(),
-            #'VCE2': df_filtered['Eoff(mJ)_175℃'].tolist(),
-            'Temperature': ['Tj = 175℃'] * len(df_filtered)
-        },
-    }
+    # 繪製黑色實線曲線
+    fig.add_trace(go.Scatter(
+        x=df['TNTC(℃)'],
+        y=df['R(Ω)'],
+        mode='lines',   # 僅使用線條
+        name='R(typ)',   # 圖例名稱
+        line=dict(color='black', width=2)  # 黑色實線，寬度 2
+    ))
 
-    # 定義目標數據點（交換 x 和 y）
-    target_currents = {
-        'Tj_25C_IC_f_VCE': [
-            {'x': 447.51, 'y': 1.1547, 'text': "450A<br>RG: 447.51<br>EREC: 1.1547"},
-            {'x': 819.11, 'y': 1.3847, 'text': "820A<br>RG: 819.11<br>EREC: 1.3847"}
-        ],
-        'Tj_150C_IC_f_VCE': [
-            {'x': 451.644, 'y': 1.263, 'text': "450A<br>RG: 451.644<br>EREC: 1.263"},
-            {'x': 823.824, 'y': 1.678, 'text': "820A<br>RG: 823.824<br>EREC: 1.678"}
-        ],
-        'Tj_175C_IC_f_VCE': [
-            {'x': 450.026, 'y': 1.303, 'text': "450A<br>RG: 450.026<br>EREC: 1.303"},
-            {'x': 824.324, 'y': 1.764, 'text': "820A<br>RG: 824.324<br>EREC: 1.764"}
-        ]
-    }
-
-    # 定義顏色對應
-    color_mapping = {
-        'Tj_25C_IC_f_VCE': 'gray',
-        'Tj_150C_IC_f_VCE': 'skyblue',
-        'Tj_175C_IC_f_VCE': 'navy'
-    }
-
-    # 繪製曲線
-    for temp_key, data in temperature_data.items():
-        if selected_temp_graph == 'ifvf_all_temperatures' or temp_key == selected_temp_graph:
-            # 確保有數據
-            if not data['Temperature']:
-                print(f"No data for {temp_key}, skipping.")
-                continue
-
-            # 設置圖表模式
-            if selected_temp_graph == 'ifvf_all_temperatures':
-                mode_vce = 'lines'  # 不顯示標記點
-                #mode_vce2 = 'lines'  # 不顯示標記點
-            else:
-                mode_vce = 'lines+markers'  # 顯示標記點
-                #mode_vce2 = 'lines+markers'  # 顯示標記點
-
-            # 添加 VCE (V) 曲線
-            fig.add_trace(go.Scatter(
-                x=data['IC'],  # 交換後的 X 軸數據
-                y=data['VCE'],  # 交換後的 Y 軸數據
-                mode=mode_vce,
-                name=f"{data['Temperature'][0]} QG",
-                line=dict(color=color_mapping[temp_key], width=2, dash='solid'),
-                marker=dict(size=6)
-            ))
-
-            # 添加 VCE2 (V) 曲線
-            #fig.add_trace(go.Scatter(
-                #x=data['IC'],  # 交換後的 X 軸數據
-                #y=data['VCE2'],  # 交換後的 Y 軸數據
-                #mode=mode_vce2,
-                #name=f"{data['Temperature'][0]} VCE2",
-                #line=dict(color=color_mapping[temp_key], width=2, dash='dash'),  # 使用虛線區分
-                #marker=dict(size=6)
-            #))
-
-            # **新增：僅在非「所有溫度」時添加標註（交換 x 和 y）**
-            if selected_temp_graph != 'ifvf_all_temperatures':
-                for point in target_currents.get(temp_key, []):
-                    fig.add_annotation(
-                        x=point['x'], y=point['y'],
-                        text=point['text'],
-                        showarrow=True,
-                        arrowhead=2,
-                        ax=0,  # 箭頭的x坐標
-                        ay=-30,  # 箭頭的y坐標，距離標籤
-                        font=dict(size=12, color='black'),  # 將字體顏色設為黑色
-                        bgcolor='rgba(255, 255, 255, 0.7)',  # 半透明背景
-                        bordercolor='rgba(255, 255, 255, 0)',  # 無邊框顏色
-                        borderwidth=1,
-                        borderpad=4
-                    )
-
-    # 設置圖表布局（更新標題和軸標籤）
-    if selected_temp_graph != 'ifvf_all_temperatures':
-        title = f"Eon, Eoff vs RG for {selected_temp_graph.replace('_', ' ')}"
-    else:
-        title = "VGE vs QG"  # 更新標題
-
+    # 設定圖表樣式和軸刻度
     fig.update_layout(
-        title=title,
-        xaxis_title="QG (μC)",  # 更新 X 軸標籤
-        yaxis_title="VGE (V)",  # 更新 Y 軸標籤
-        margin=dict(l=40, r=40, t=60, b=40),  # 增加邊距
-        paper_bgcolor='white',  # 設置背景顏色為白色
-        plot_bgcolor='white',  # 設置圖表區域背景為白色
-        font=dict(
-            family="Arial, sans-serif",
-            size=14,
-            color="black"
-        ),
-        titlefont=dict(size=20, color='black'),  # 主標題字體大小和顏色
+        title="NTC-Thermistor Temperature Characteristics",
+        xaxis_title="T<sub>NTC</sub> (℃)",
+        yaxis_title="R (Ω)",
+        margin=dict(l=50, r=50, t=50, b=50),  # 調整邊距以容納框線
+        plot_bgcolor="white",
+        font=dict(size=12),  # 設定整體字體大小
         xaxis=dict(
-            showgrid=True,  # 顯示網格線
-            gridcolor='lightgrey',  # 網格線顏色
-            tickmode='linear',
-            dtick=0.2,  # 設置刻度間隔為200
-            range=[0, 2],  # 調整X軸範圍以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
+            showgrid=True,
+            gridcolor='lightgray',
+            tickmode='array',
+            tickvals=[0, 25, 50, 75, 100, 125, 150, 175],  # 設定 x 軸刻度
+            title_font=dict(size=16),
+            showline=True,       # 顯示 x 軸線
+            mirror=True,         # 軸線鏡像對稱（四周都有線）
+            linecolor='black',   # 軸線顏色
+            linewidth=2,         # 軸線寬度
+            zeroline=True,       # 顯示 x 軸零線
+            zerolinecolor='black',  # 設定零線顏色
+            zerolinewidth=2      # 零線寬度
         ),
         yaxis=dict(
             showgrid=True,
-            gridcolor='lightgrey',
-            tickmode='linear',
-            dtick=2,  # 根據新的 Y 軸數據調整刻度間隔
-            tick0=-8,  # 設置起始刻度為0
-            range=[-8, 20],  # 調整範圍為0到140V以匹配滑桿
-            zeroline=False,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
+            gridcolor='lightgray',
+            type='log',  # 使用對數刻度
+            tickmode='array',
+            tickvals=[100000, 10000, 1000, 100, 10],  # 調整 y 軸區間
+            title_font=dict(size=16),
+            showline=True,       # 顯示 y 軸線
+            mirror=True,         # 軸線鏡像對稱（四周都有線）
+            linecolor='black',   # 軸線顏色
+            linewidth=2,         # 軸線寬度
+            zeroline=True,       # 顯示 y 軸零線
+            zerolinecolor='black',  # 設定零線顏色
+            zerolinewidth=2      # 零線寬度
         ),
         legend=dict(
-            x=1,
-            y=0.99,
-            bgcolor='rgba(255,255,255,0)',
-            bordercolor='rgba(0,0,0,0)'
-        )
-    )
-
-    # 準備表格數據
-    table_data = []
-    if selected_temp_table == 'ifvf_all_temperatures':
-        for temp_key, data in temperature_data.items():
-            # 過濾掉 IC、VCE 或 VCE2 為 NaN 的行
-            valid_data = [
-                {
-                    '編號': idx + 1 + len(table_data),
-                    '溫度': temp,
-                    'IC (A)': f"{ic:.3f}",
-                    'VCE (V)': f"{vce:.4f}",
-                    #'VCE2 (V)': f"{vce2:.4f}"
-                }
-                for idx, (temp, ic, vce) in enumerate(zip(data['Temperature'], data['IC'], data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-            table_data.extend(valid_data)
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-            # 過濾掉 IC、VCE 或 VCE2 為 NaN 的行
-            table_data = [
-                {
-                    '編號': idx + 1,
-                    '溫度': temp,
-                    'IC (A)': f"{ic:.3f}",
-                    'VCE (V)': f"{vce:.4f}"
-                    #'VCE2 (V)': f"{vce2:.4f}"
-                }
-                for idx, (temp, ic, vce) in enumerate(zip(temp_data['Temperature'], temp_data['IC'], temp_data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-        else:
-            table_data = []
-
-    # 定義表格欄位（保持不變）
-    columns = [
-        {"name": "Index", "id": "編號"},
-        {"name": "Temperature (°C)", "id": "溫度"},
-        {"name": "QG(μC)", "id": "IC (A)"},
-        {"name": "VGE (V)", "id": "VCE (V)"}
-        #{"name": "EOFF (MJ)", "id": "VCE2 (V)"}
-    ]
-
-    fig.add_hline(
-        y=-8,
-        line_color='black',
-        line_width=3,
-        #annotation_text=None  # 或乾脆不寫此參數
-    )
-
-    return fig, table_data, columns
-
-
-
-
-
-
-#++++
- # 750V820AEREC(RG)_H,create_loss_analysis_card6(),update_loss_analysis6()
-@app.callback(
-    [Output('loss_loss-graph6', 'figure'),
-     Output('loss_loss-table6', 'data'),
-     Output('loss_loss-table6', 'columns')],
-    [Input('loss_temperature-dropdown-graph6', 'value'),
-     Input('loss_ic-range-slider6', 'value'),
-     Input('loss_vce-range-slider6', 'value'),
-     Input('loss_temperature-dropdown-table6', 'value')]
-)
-def update_loss_analysis6(selected_temp_graph, ic_range, vce_range, selected_temp_table):
-    print(f"update_loss_analysis6 triggered with: selected_temp_graph={selected_temp_graph}, ic_range={ic_range}, erec_range={vce_range}, selected_temp_table={selected_temp_table}")
-
-    df = load_data(DATA_FILE_PATH6)
-    if df.empty:
-        print("DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "RG (Ω)", "id": "RG (Ω)"},
-            {"name": "EREC (mJ)", "id": "EREC (mJ)"},
-
-        ]
-        return empty_fig, empty_data, empty_columns
-
-    # 過濾數據中的負值
-    df_filtered = df
-    print("U4-2305.")  # 調試輸出
-    # 假設 DATA_FILE_PATH 包含 Tj = 25°C, 150°C, 175°C 的數據
-    conditions = []
-    for temp in ['25℃', '150℃', '175℃']:
-        rg_col = f'RG_{temp}'
-        print(f"U4 rg_col: {rg_col}")
-        erec_col = f'Erec(mJ)_{temp}'  # Eon card6
-        print(f"U4 Erec_col: {erec_col}")
-        #vce_col2 = f'Eoff(mJ)_{temp}'  # Eoff card6
-        #print(f"U4 Eoff_col: {vce_col2}")
-    if rg_col in df_filtered.columns and erec_col in df_filtered.columns:
-            conditions.append(
-                (df_filtered[rg_col] >= ic_range[0]) & (df_filtered[rg_col] <= ic_range[1]) &
-                (df_filtered[erec_col] >= vce_range[0]) & (df_filtered[erec_col] <= vce_range[1])
-                #(df_filtered[vce_col2] >= vce_range[0]) & (df_filtered[vce_col2] <= vce_range[1])
-    )
-
-    if selected_temp_graph == 'ifvf_all_temperatures':
-        # 對所有溫度進行過濾
-        combined_condition = False
-        for condition in conditions:
-            combined_condition |= condition
-        df_filtered = df_filtered[combined_condition]
-        print(f"Filtered DataFrame for ifvf_all_temperatures: {df_filtered.shape[0]} rows.")  # 調試輸出
-    else:
-        temp_key = selected_temp_graph  # e.g., 'Tj_25C_IC_f_VCE'
-        # 從 temp_key 中提取溫度
-        temp_parts = temp_key.split('_')
-        if len(temp_parts) >= 3:
-            temp_str = temp_parts[1]  # '25C'
-            temp_str = temp_str.replace('C', '℃')  # '25℃'
-            RG_col = f'RG(Ω)_{temp_str}'
-            EREC_col = f'EREC(mJ)_{temp_str}'
-            #vce_col2 = f'Eoff(mJ)_{temp_str}'
-            if rg_col in df_filtered.columns and RG_col in df_filtered.columns and EREC_col in df_filtered.columns:
-                df_filtered = df_filtered[
-                    (df_filtered[rg_col] >= ic_range[0]) & (df_filtered[rg_col] <= ic_range[1]) &
-                    (df_filtered[EREC_col] >= vce_range[0]) & (df_filtered[EREC_col] <= vce_range[1])
-                    #(df_filtered[vce_col2] >= vce_range[0]) & (df_filtered[vce_col2] <= vce_range[1])
-                ]
-                print(f"Filtered DataFrame for {temp_key}: {df_filtered.shape[0]} rows.")  # 調試輸出
-            else:
-                print(f"Columns {rg_col} and/or {erec_col} not found in DataFrame.")  # 調試輸出
-                df_filtered = pd.DataFrame()  # 清空 DataFrame
-        else:
-            print(f"Unexpected temp_key format: {temp_key}")  # 調試輸出
-            df_filtered = pd.DataFrame()  # 清空 DataFrame
-
-    if df_filtered.empty:
-        print("Filtered DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "RG (Ω)", "id": "RG (Ω)"},
-            {"name": "EREC (mJ)", "id": "EREC (mJ)"}
-            #{"name": "VCE2 (V)", "id": "VCE2 (V)"}
-        ]
-        return empty_fig, empty_data, empty_columns
-
-    # 初始化圖表
-    fig = go.Figure()
-
-    # 整理數據
-    temperature_data = {
-        'Tj_25C_IC_f_VCE': {
-            'IC': df_filtered['RG_25℃'].tolist(),
-            'VCE': df_filtered['Erec(mJ)_25℃'].tolist(),
-            #'VCE2': df_filtered['Eoff(mJ)_25℃'].tolist(),
-            'Temperature': ['Tj = 25℃'] * len(df_filtered)
-        },
-        'Tj_150C_IC_f_VCE': {
-            'IC': df_filtered['RG_150℃'].tolist(),
-            'VCE': df_filtered['Erec(mJ)_150℃'].tolist(),
-            #'VCE2': df_filtered['Eoff(mJ)_150℃'].tolist(),
-            'Temperature': ['Tj = 150℃'] * len(df_filtered)
-        },
-        'Tj_175C_IC_f_VCE': {
-            'IC': df_filtered['RG_175℃'].tolist(),
-            'VCE': df_filtered['Erec(mJ)_175℃'].tolist(),
-            #'VCE2': df_filtered['Eoff(mJ)_175℃'].tolist(),
-            'Temperature': ['Tj = 175℃'] * len(df_filtered)
-        },
-    }
-
-    # 定義目標數據點（交換 x 和 y）
-    target_currents = {
-        'Tj_25C_IC_f_VCE': [
-            {'x': 447.51, 'y': 1.1547, 'text': "450A<br>RG: 447.51<br>EREC: 1.1547"},
-            {'x': 819.11, 'y': 1.3847, 'text': "820A<br>RG: 819.11<br>EREC: 1.3847"}
-        ],
-        'Tj_150C_IC_f_VCE': [
-            {'x': 451.644, 'y': 1.263, 'text': "450A<br>RG: 451.644<br>EREC: 1.263"},
-            {'x': 823.824, 'y': 1.678, 'text': "820A<br>RG: 823.824<br>EREC: 1.678"}
-        ],
-        'Tj_175C_IC_f_VCE': [
-            {'x': 450.026, 'y': 1.303, 'text': "450A<br>RG: 450.026<br>EREC: 1.303"},
-            {'x': 824.324, 'y': 1.764, 'text': "820A<br>RG: 824.324<br>EREC: 1.764"}
-        ]
-    }
-
-    # 定義顏色對應
-    color_mapping = {
-        'Tj_25C_IC_f_VCE': 'gray',
-        'Tj_150C_IC_f_VCE': 'skyblue',
-        'Tj_175C_IC_f_VCE': 'navy'
-    }
-
-    # 繪製曲線
-    for temp_key, data in temperature_data.items():
-        if selected_temp_graph == 'ifvf_all_temperatures' or temp_key == selected_temp_graph:
-            # 確保有數據
-            if not data['Temperature']:
-                print(f"No data for {temp_key}, skipping.")
-                continue
-
-            # 設置圖表模式
-            if selected_temp_graph == 'ifvf_all_temperatures':
-                mode_vce = 'lines'  # 不顯示標記點
-                #mode_vce2 = 'lines'  # 不顯示標記點
-            else:
-                mode_vce = 'lines+markers'  # 顯示標記點
-                #mode_vce2 = 'lines+markers'  # 顯示標記點
-
-            # 添加 VCE (V) 曲線
-            fig.add_trace(go.Scatter(
-                x=data['IC'],  # 交換後的 X 軸數據
-                y=data['VCE'],  # 交換後的 Y 軸數據
-                mode=mode_vce,
-                name=f"{data['Temperature'][0]} RG",
-                line=dict(color=color_mapping[temp_key], width=2, dash='solid'),
-                marker=dict(size=6)
-            ))
-
-            # 添加 VCE2 (V) 曲線
-            #fig.add_trace(go.Scatter(
-                #x=data['IC'],  # 交換後的 X 軸數據
-                #y=data['VCE2'],  # 交換後的 Y 軸數據
-                #mode=mode_vce2,
-                #name=f"{data['Temperature'][0]} VCE2",
-                #line=dict(color=color_mapping[temp_key], width=2, dash='dash'),  # 使用虛線區分
-                #marker=dict(size=6)
-            #))
-
-            # **新增：僅在非「所有溫度」時添加標註（交換 x 和 y）**
-            if selected_temp_graph != 'ifvf_all_temperatures':
-                for point in target_currents.get(temp_key, []):
-                    fig.add_annotation(
-                        x=point['x'], y=point['y'],
-                        text=point['text'],
-                        showarrow=True,
-                        arrowhead=2,
-                        ax=0,  # 箭頭的x坐標
-                        ay=-30,  # 箭頭的y坐標，距離標籤
-                        font=dict(size=12, color='black'),  # 將字體顏色設為黑色
-                        bgcolor='rgba(255, 255, 255, 0.7)',  # 半透明背景
-                        bordercolor='rgba(255, 255, 255, 0)',  # 無邊框顏色
-                        borderwidth=1,
-                        borderpad=4
-                    )
-
-    # 設置圖表布局（更新標題和軸標籤）
-    if selected_temp_graph != 'ifvf_all_temperatures':
-        title = f"Eon, Eoff vs RG for {selected_temp_graph.replace('_', ' ')}"
-    else:
-        title = "EREC vs RG"  # 更新標題
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="RG (Ω)",  # 更新 X 軸標籤
-        yaxis_title="EREC (mJ)",  # 更新 Y 軸標籤
-        margin=dict(l=40, r=40, t=60, b=40),  # 增加邊距
-        paper_bgcolor='white',  # 設置背景顏色為白色
-        plot_bgcolor='white',  # 設置圖表區域背景為白色
-        font=dict(
-            family="Arial, sans-serif",
-            size=14,
-            color="black"
+            title="",  # 移除圖例標題
+            x=0.02,    # x 座標 (0 左邊, 1 右邊)
+            y=0.98,    # y 座標 (0 底部, 1 頂部)
+            xanchor="left",  # x 座標錨點
+            yanchor="top",   # y 座標錨點
+            bgcolor="rgba(255, 255, 255, 0.8)",  # 半透明白色背景
+            bordercolor="black",  # 黑色邊框
+            borderwidth=1,        # 邊框寬度
+            font=dict(size=12),    # 字體大小
+            orientation="v",       # 垂直排列
+            traceorder="normal",   # 圖例順序
         ),
-        titlefont=dict(size=20, color='black'),  # 主標題字體大小和顏色
-        xaxis=dict(
-            showgrid=True,  # 顯示網格線
-            gridcolor='lightgrey',  # 網格線顏色
-            tickmode='linear',
-            dtick=5,  # 設置刻度間隔為200
-            range=[0, 25],  # 調整X軸範圍以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
-        ),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor='lightgrey',
-            tickmode='linear',
-            dtick=2,  # 根據新的 Y 軸數據調整刻度間隔
-            tick0=0,  # 設置起始刻度為0
-            range=[0, 15],  # 調整範圍為0到140V以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
-        ),
-        legend=dict(
-            x=1,
-            y=0.99,
-            bgcolor='rgba(255,255,255,0)',
-            bordercolor='rgba(0,0,0,0)'
-        )
-    )
-
-    # 準備表格數據
-    table_data = []
-    if selected_temp_table == 'ifvf_all_temperatures':
-        for temp_key, data in temperature_data.items():
-            # 過濾掉 IC、VCE 或 VCE2 為 NaN 的行
-            valid_data = [
-                {
-                    '編號': idx + 1 + len(table_data),
-                    '溫度': temp,
-                    'IC (A)': f"{ic:.3f}",
-                    'VCE (V)': f"{vce:.4f}"
-                    #'VCE2 (V)': f"{vce2:.4f}"
-                }
-                for idx, (temp, ic, vce) in enumerate(zip(data['Temperature'], data['IC'], data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-            table_data.extend(valid_data)
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-            # 過濾掉 IC、VCE 或 VCE2 為 NaN 的行
-            table_data = [
-                {
-                    '編號': idx + 1,
-                    '溫度': temp,
-                    'IC (A)': f"{ic:.3f}",
-                    'VCE (V)': f"{vce:.4f}"
-                    #'VCE2 (V)': f"{vce2:.4f}"
-                }
-                for idx, (temp, ic, vce) in enumerate(zip(temp_data['Temperature'], temp_data['IC'], temp_data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-        else:
-            table_data = []
-
-    # 定義表格欄位（保持不變）
-    columns = [
-        {"name": "Index", "id": "編號"},
-        {"name": "Temperature (°C)", "id": "溫度"},
-        {"name": "RG(Ω)", "id": "IC (A)"},
-        {"name": "EREC (MJ)", "id": "VCE (V)"}
-        #{"name": "EOFF (MJ)", "id": "VCE2 (V)"}
-    ]
-
-    return fig, table_data, columns
-
-
-
-#++++
-# 750V820AEon & Eoff(RG)_E,create_loss_analysis_card5(),update_loss_analysis5()
-@app.callback(
-    [Output('loss_loss-graph5', 'figure'),
-     Output('loss_loss-table5', 'data'),
-     Output('loss_loss-table5', 'columns')],
-    [Input('loss_temperature-dropdown-graph5', 'value'),
-     Input('loss_ic-range-slider5', 'value'),
-     Input('loss_vce-range-slider5', 'value'),
-     Input('loss_temperature-dropdown-table5', 'value')]
-)
-def update_loss_analysis5(selected_temp_graph, ic_range, vce_range, selected_temp_table):
-    print(f"update_loss_analysis4 triggered with: selected_temp_graph={selected_temp_graph}, ic_range={ic_range}, vce_range={vce_range}, selected_temp_table={selected_temp_table}")
-
-    df = load_data(DATA_FILE_PATH5)
-    if df.empty:
-        print("DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "IC (A)", "id": "IC (A)"},
-            {"name": "VCE (V)", "id": "VCE (V)"},
-            {"name": "VCE2 (V)", "id": "VCE2 (V)"}
-        ]
-        return empty_fig, empty_data, empty_columns
-
-    # 過濾數據中的負值
-    df_filtered = df
-    print("U4-2305.")  # 調試輸出
-    # 假設 DATA_FILE_PATH 包含 Tj = 25°C, 150°C, 175°C 的數據
-    conditions = []
-    for temp in ['25℃', '150℃', '175℃']:
-        ic_col = f'RG_{temp}'
-        print(f"U4 ic_col: {ic_col}")
-        vce_col = f'Eon(mJ)_{temp}'  # Eon card4
-        print(f"U4 Eon_col: {vce_col}")
-        vce_col2 = f'Eoff(mJ)_{temp}'  # Eoff card4
-        print(f"U4 Eoff_col: {vce_col2}")
-        if ic_col in df_filtered.columns and vce_col in df_filtered.columns and vce_col2 in df_filtered.columns:
-            conditions.append(
-                (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1]) &
-                (df_filtered[vce_col2] >= vce_range[0]) & (df_filtered[vce_col2] <= vce_range[1])
+        showlegend=True,  # 確保顯示圖例
+        shapes=[
+             #水平參考線（x 軸）
+            dict(
+                type="line",
+                x0=0,
+                y0=1,
+                x1=175,
+                y1=1,
+                line=dict(color="black", width=1, dash="dash")
+            ),
+             #垂直參考線（y 軸）
+            dict(
+                type="line",
+                x0=50,
+                y0=10,
+                x1=50,
+                y1=100000,
+                line=dict(color="black", width=1, dash="dash")
             )
-
-    if selected_temp_graph == 'ifvf_all_temperatures':
-        # 對所有溫度進行過濾
-        combined_condition = False
-        for condition in conditions:
-            combined_condition |= condition
-        df_filtered = df_filtered[combined_condition]
-        print(f"Filtered DataFrame for ifvf_all_temperatures: {df_filtered.shape[0]} rows.")  # 調試輸出
-    else:
-        temp_key = selected_temp_graph  # e.g., 'Tj_25C_IC_f_VCE'
-        # 從 temp_key 中提取溫度
-        temp_parts = temp_key.split('_')
-        if len(temp_parts) >= 3:
-            temp_str = temp_parts[1]  # '25C'
-            temp_str = temp_str.replace('C', '℃')  # '25℃'
-            ic_col = f'IC(A)_{temp_str}'
-            vce_col = f'Eon(mJ)_{temp_str}'
-            vce_col2 = f'Eoff(mJ)_{temp_str}'
-            if ic_col in df_filtered.columns and vce_col in df_filtered.columns and vce_col2 in df_filtered.columns:
-                df_filtered = df_filtered[
-                    (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                    (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1]) &
-                    (df_filtered[vce_col2] >= vce_range[0]) & (df_filtered[vce_col2] <= vce_range[1])
-                ]
-                print(f"Filtered DataFrame for {temp_key}: {df_filtered.shape[0]} rows.")  # 調試輸出
-            else:
-                print(f"Columns {ic_col} and/or {vce_col} and/or {vce_col2} not found in DataFrame.")  # 調試輸出
-                df_filtered = pd.DataFrame()  # 清空 DataFrame
-        else:
-            print(f"Unexpected temp_key format: {temp_key}")  # 調試輸出
-            df_filtered = pd.DataFrame()  # 清空 DataFrame
-
-    if df_filtered.empty:
-        print("Filtered DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "IC (A)", "id": "IC (A)"},
-            {"name": "VCE (V)", "id": "VCE (V)"},
-            {"name": "VCE2 (V)", "id": "VCE2 (V)"}
         ]
-        return empty_fig, empty_data, empty_columns
+    )
 
-    # 初始化圖表
+    return fig
+
+
+
+
+# 回調函數：I 卡片
+@app.callback(
+    Output('graph-extra2', 'figure'),
+    Input('upload-extra2', 'contents'),
+    State('upload-extra2', 'filename')
+)
+def update_graph_i(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or len(df.columns) < 2:
+        return go.Figure()
+
     fig = go.Figure()
 
-    # 整理數據
-    temperature_data = {
-        'Tj_25C_IC_f_VCE': {
-            'IC': df_filtered['RG_25℃'].tolist(),
-            'VCE': df_filtered['Eon(mJ)_25℃'].tolist(),
-            'VCE2': df_filtered['Eoff(mJ)_25℃'].tolist(),
-            'Temperature': ['Tj = 25℃'] * len(df_filtered)
-        },
-        'Tj_150C_IC_f_VCE': {
-            'IC': df_filtered['RG_150℃'].tolist(),
-            'VCE': df_filtered['Eon(mJ)_150℃'].tolist(),
-            'VCE2': df_filtered['Eoff(mJ)_150℃'].tolist(),
-            'Temperature': ['Tj = 150℃'] * len(df_filtered)
-        },
-        'Tj_175C_IC_f_VCE': {
-            'IC': df_filtered['RG_175℃'].tolist(),
-            'VCE': df_filtered['Eon(mJ)_175℃'].tolist(),
-            'VCE2': df_filtered['Eoff(mJ)_175℃'].tolist(),
-            'Temperature': ['Tj = 175℃'] * len(df_filtered)
-        },
+    # 定義每條線段的對應欄位與線型樣式
+    line_styles = {
+        'Erec, Tj = 25℃': {'ic_col': 'IC(A)', 'erec_col': 'Erec(mJ)', 'dash': 'solid'},
+        'Erec, Tj = 150℃': {'ic_col': 'IC(A).1', 'erec_col': 'Erec(mJ).1', 'dash': 'dash'},
+        'Erec, Tj = 175℃': {'ic_col': 'IC(A).2', 'erec_col': 'Erec(mJ).2', 'dash': 'dot'}
     }
 
-    # 定義目標數據點（交換 x 和 y）
-    target_currents = {
-        'Tj_25C_IC_f_VCE': [
-            {'x': 447.51, 'y': 1.1547, 'text': "450A<br>IC: 447.51<br>VCE: 1.1547"},
-            {'x': 819.11, 'y': 1.3847, 'text': "820A<br>IC: 819.11<br>VCE: 1.3847"}
-        ],
-        'Tj_150C_IC_f_VCE': [
-            {'x': 451.644, 'y': 1.263, 'text': "450A<br>IC: 451.644<br>VCE: 1.263"},
-            {'x': 823.824, 'y': 1.678, 'text': "820A<br>IC: 823.824<br>VCE: 1.678"}
-        ],
-        'Tj_175C_IC_f_VCE': [
-            {'x': 450.026, 'y': 1.303, 'text': "450A<br>IC: 450.026<br>VCE: 1.303"},
-            {'x': 824.324, 'y': 1.764, 'text': "820A<br>IC: 824.324<br>VCE: 1.764"}
-        ]
-    }
+    # 確保數據中包含所需的欄位
+    required_columns = set(sum([[v['ic_col'], v['erec_col']] for v in line_styles.values()], []))
+    if not required_columns.issubset(df.columns):
+        print("缺少必要的欄位:", required_columns - set(df.columns))
+        return go.Figure()
 
-    # 定義顏色對應
-    color_mapping = {
-        'Tj_25C_IC_f_VCE': 'gray',
-        'Tj_150C_IC_f_VCE': 'skyblue',
-        'Tj_175C_IC_f_VCE': 'navy'
-    }
+    # 依據定義的樣式逐條添加線段
+    for set_name, params in line_styles.items():
+        fig.add_trace(go.Scatter(
+            x=df[params['ic_col']],
+            y=df[params['erec_col']],
+            mode='lines',
+            name=set_name,
+            line=dict(color='black', dash=params['dash'])
+        ))
 
-    # 繪製曲線
-    for temp_key, data in temperature_data.items():
-        if selected_temp_graph == 'ifvf_all_temperatures' or temp_key == selected_temp_graph:
-            # 確保有數據
-            if not data['Temperature']:
-                print(f"No data for {temp_key}, skipping.")
-                continue
+    # 加入 X 軸與 Y 軸的 0 軸線 (黑色框線)
+    zero_line_shapes = [
+        dict(type='line', x0=0, x1=0, y0=0, y1=1, xref='x', yref='paper', line=dict(color='black', width=1)),
+        dict(type='line', x0=0, x1=1, y0=0, y1=0, xref='paper', yref='y', line=dict(color='black', width=1))
+    ]
 
-            # 設置圖表模式
-            if selected_temp_graph == 'ifvf_all_temperatures':
-                mode_vce = 'lines'  # 不顯示標記點
-                mode_vce2 = 'lines'  # 不顯示標記點
-            else:
-                mode_vce = 'lines+markers'  # 顯示標記點
-                mode_vce2 = 'lines+markers'  # 顯示標記點
-
-            # 添加 VCE (V) 曲線
-            fig.add_trace(go.Scatter(
-                x=data['IC'],  # 交換後的 X 軸數據
-                y=data['VCE'],  # 交換後的 Y 軸數據
-                mode=mode_vce,
-                name=f"{data['Temperature'][0]} VCE",
-                line=dict(color=color_mapping[temp_key], width=2, dash='solid'),
-                marker=dict(size=6)
-            ))
-
-            # 添加 VCE2 (V) 曲線
-            fig.add_trace(go.Scatter(
-                x=data['IC'],  # 交換後的 X 軸數據
-                y=data['VCE2'],  # 交換後的 Y 軸數據
-                mode=mode_vce2,
-                name=f"{data['Temperature'][0]} VCE2",
-                line=dict(color=color_mapping[temp_key], width=2, dash='dash'),  # 使用虛線區分
-                marker=dict(size=6)
-            ))
-
-            # **新增：僅在非「所有溫度」時添加標註（交換 x 和 y）**
-            if selected_temp_graph != 'ifvf_all_temperatures':
-                for point in target_currents.get(temp_key, []):
-                    fig.add_annotation(
-                        x=point['x'], y=point['y'],
-                        text=point['text'],
-                        showarrow=True,
-                        arrowhead=2,
-                        ax=0,  # 箭頭的x坐標
-                        ay=-30,  # 箭頭的y坐標，距離標籤
-                        font=dict(size=12, color='black'),  # 將字體顏色設為黑色
-                        bgcolor='rgba(255, 255, 255, 0.7)',  # 半透明背景
-                        bordercolor='rgba(255, 255, 255, 0)',  # 無邊框顏色
-                        borderwidth=1,
-                        borderpad=4
-                    )
-
-    # 設置圖表布局（更新標題和軸標籤）
-    if selected_temp_graph != 'ifvf_all_temperatures':
-        title = f"Eon, Eoff vs RG for {selected_temp_graph.replace('_', ' ')}"
-    else:
-        title = "Eon, Eoff vs RG"  # 更新標題
-
+    # 設定 X 軸與 Y 軸範圍、刻度與格式
     fig.update_layout(
-        title=title,
-        xaxis_title="RG",  # 更新 X 軸標籤
-        yaxis_title="E (mJ)",  # 更新 Y 軸標籤
-        margin=dict(l=40, r=40, t=60, b=40),  # 增加邊距
-        paper_bgcolor='white',  # 設置背景顏色為白色
-        plot_bgcolor='white',  # 設置圖表區域背景為白色
-        font=dict(
-            family="Arial, sans-serif",
-            size=14,
-            color="black"
-        ),
-        titlefont=dict(size=20, color='black'),  # 主標題字體大小和顏色
+        title="Erec vs IF(A)",
+        xaxis_title="I<sub>F</sub> (A)",
+        yaxis_title="E (mJ)",
+        margin=dict(l=40, r=20, t=40, b=40),
+        plot_bgcolor="white",
         xaxis=dict(
-            showgrid=True,  # 顯示網格線
-            gridcolor='lightgrey',  # 網格線顏色
-            tickmode='linear',
-            dtick=5,  # 設置刻度間隔為200
-            range=[0, 25],  # 調整X軸範圍以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
+            range=[0, 1400],  # 設定 X 軸範圍
+            tickvals=list(range(0, 1401, 200)),  # 設定刻度 0, 200, 400, ..., 1400
+            showgrid=True, gridcolor='lightgray',
+            showline=True, linewidth=1, linecolor='black', mirror=True
+        ),
+        yaxis=dict(
+            range=[0, 16],  # 設定 Y 軸範圍
+            tickvals=list(range(0, 17, 2)),  # 設定刻度 0, 2, 4, ..., 16
+            showgrid=True, gridcolor='lightgray',
+            showline=True, linewidth=1, linecolor='black', mirror=True
+        ),
+        legend=dict(
+            x=0.02, y=0.98,
+            bgcolor="white",
+            bordercolor="black",
+            borderwidth=2
+        ),
+        shapes=zero_line_shapes
+    )
+
+    return fig
+
+
+# 回調函數：J 卡片
+@app.callback(
+    Output('graph-extra3', 'figure'),
+    Input('upload-extra3', 'contents'),
+    State('upload-extra3', 'filename')
+)
+def update_graph_j(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+    if df is None or len(df.columns) < 2:
+        return go.Figure()
+
+    fig = go.Figure()
+
+    # 定義 Erec 在不同溫度下的線條樣式
+    line_styles = {
+        'Erec 25℃': {'rg_col': 'RG_25℃', 'erec_col': 'Erec(mJ)_25℃', 'dash': 'solid'},
+        'Erec 150℃': {'rg_col': 'RG_150℃', 'erec_col': 'Erec(mJ)_150℃', 'dash': 'dash'},
+        'Erec 175℃': {'rg_col': 'RG_175℃', 'erec_col': 'Erec(mJ)_175℃', 'dash': 'dot'}
+    }
+
+    # 確保數據中包含所需的欄位
+    required_columns = set(sum([[v['rg_col'], v['erec_col']] for v in line_styles.values()], []))
+    if not required_columns.issubset(df.columns):
+        print("缺少必要的欄位:", required_columns - set(df.columns))
+        return go.Figure()
+
+    # 依據定義的樣式逐條添加線段
+    for set_name, params in line_styles.items():
+        fig.add_trace(go.Scatter(
+            x=df[params['rg_col']],
+            y=df[params['erec_col']],
+            mode='lines',
+            name=set_name,
+            line=dict(color='black', dash=params['dash'])
+        ))
+
+    # 加入 X 軸與 Y 軸的 0 軸線 (黑色框線)
+    zero_line_shapes = [
+        dict(type='line', x0=0, x1=0, y0=0, y1=1, xref='x', yref='paper', line=dict(color='black', width=1)),
+        dict(type='line', x0=0, x1=1, y0=0, y1=0, xref='paper', yref='y', line=dict(color='black', width=1))
+    ]
+
+    # 設定 X 軸與 Y 軸範圍、刻度與格式
+    fig.update_layout(
+        title="Erec vs RG (Ω)",
+        xaxis_title="R<sub>G</sub> (Ω)",
+        yaxis_title="E (mJ)",
+        margin=dict(l=40, r=20, t=40, b=40),
+        plot_bgcolor="white",
+        xaxis=dict(
+            range=[0, 25],  # 設定 X 軸範圍
+            tickvals=list(range(0, 26, 5)),  # 設定刻度 0, 5, 10, ..., 25
+            showgrid=True, gridcolor='lightgray',
+            showline=True, linewidth=1, linecolor='black', mirror=True
+        ),
+        yaxis=dict(
+            range=[0, 16],  # 設定 Y 軸範圍
+            tickvals=list(range(0, 17, 2)),  # 設定刻度 0, 2, 4, ..., 16
+            showgrid=True, gridcolor='lightgray',
+            showline=True, linewidth=1, linecolor='black', mirror=True
+        ),
+        legend=dict(
+            x=0.02, y=0.98,
+            bgcolor="white",
+            bordercolor="black",
+            borderwidth=2
+        ),
+        shapes=zero_line_shapes
+    )
+
+    return fig
+
+
+
+# 回調函數：K 卡片
+@app.callback(
+    Output('graph-extra4', 'figure'),
+    Input('upload-extra4', 'contents'),
+    State('upload-extra4', 'filename')
+)
+def update_graph_k(contents, filename):
+    if contents is None:
+        return go.Figure()
+
+    df = parse_contents(contents, filename)
+
+    # 確保數據包含必要的欄位
+    required_columns = ['VCE_Chip', 'IC_Chip', 'VCE_Module', 'IC_Module']
+    if df is None or not all(col in df.columns for col in required_columns):
+        print("Missing required columns:", df.columns)
+        return go.Figure()
+
+    fig = go.Figure()
+
+    # 添加 Chip 線
+    fig.add_trace(go.Scatter(
+        x=df['VCE_Chip'], y=df['IC_Chip'],
+        mode='lines', name='IC, Chip',
+        line=dict(color='black', dash='solid')  # 實線
+    ))
+
+    # 添加 Module 線
+    fig.add_trace(go.Scatter(
+        x=df['VCE_Module'], y=df['IC_Module'],
+        mode='lines', name='IC, Module',
+        line=dict(color='black', dash='dash')  # 虛線
+    ))
+
+
+    # 更新圖表佈局
+    fig.update_layout(
+        title="",  # 不需要標題
+        xaxis_title="V<sub>CE</sub> (V)",  # X 軸標籤
+        yaxis_title="I<sub>C</sub> (A)",  # Y 軸標籤
+        margin=dict(l=60, r=20, t=20, b=50),  # 控制邊界間距
+        plot_bgcolor="white",  # 白色背景
+        font=dict(size=12),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="lightgray",
+            linecolor="black",  # X 軸線條顏色
+            linewidth=1,
+            mirror=True,  # 顯示上方和下方軸線
+            tickvals=list(range(0, 901, 100)),  # 設定刻度
+            range=[0, 800]  # 設定 X 軸範圍
         ),
         yaxis=dict(
             showgrid=True,
-            gridcolor='lightgrey',
-            tickmode='linear',
-            dtick=20,  # 根據新的 Y 軸數據調整刻度間隔
-            tick0=0,  # 設置起始刻度為0
-            range=[0, 120],  # 調整範圍為0到140V以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
+            gridcolor="lightgray",
+            linecolor="black",  # Y 軸線條顏色
+            linewidth=1,
+            mirror=True,  # 顯示左方和右方軸線
+            tickvals=list(range(0, 1901, 200)),  # 設定刻度
+            range=[0, 1800]  # 設定 Y 軸範圍
         ),
         legend=dict(
-            x=1,
-            y=0.99,
-            bgcolor='rgba(255,255,255,0)',
-            bordercolor='rgba(0,0,0,0)'
+            x=0.02, y=0.89,  # 圖例位置
+            bgcolor="white",  # 白色背景
+            bordercolor="black",  # 黑色邊框
+            borderwidth=2  # 邊框寬度
         )
     )
 
-    # 準備表格數據
-    table_data = []
-    if selected_temp_table == 'ifvf_all_temperatures':
-        for temp_key, data in temperature_data.items():
-            # 過濾掉 IC、VCE 或 VCE2 為 NaN 的行
-            valid_data = [
-                {
-                    '編號': idx + 1 + len(table_data),
-                    '溫度': temp,
-                    'IC (A)': f"{ic:.3f}",
-                    'VCE (V)': f"{vce:.4f}",
-                    'VCE2 (V)': f"{vce2:.4f}"
-                }
-                for idx, (temp, ic, vce, vce2) in enumerate(zip(data['Temperature'], data['IC'], data['VCE'], data['VCE2']))
-                if not (pd.isna(ic) or pd.isna(vce) or pd.isna(vce2))
-            ]
-            table_data.extend(valid_data)
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-            # 過濾掉 IC、VCE 或 VCE2 為 NaN 的行
-            table_data = [
-                {
-                    '編號': idx + 1,
-                    '溫度': temp,
-                    'IC (A)': f"{ic:.3f}",
-                    'VCE (V)': f"{vce:.4f}",
-                    'VCE2 (V)': f"{vce2:.4f}"
-                }
-                for idx, (temp, ic, vce, vce2) in enumerate(zip(temp_data['Temperature'], temp_data['IC'], temp_data['VCE'], temp_data['VCE2']))
-                if not (pd.isna(ic) or pd.isna(vce) or pd.isna(vce2))
-            ]
-        else:
-            table_data = []
-
-    # 定義表格欄位（保持不變）
-    columns = [
-        {"name": "Index", "id": "編號"},
-        {"name": "Temperature (°C)", "id": "溫度"},
-        {"name": "RG", "id": "IC (A)"},
-        {"name": "EON (MJ)", "id": "VCE (V)"},
-        {"name": "EOFF (MJ)", "id": "VCE2 (V)"}
-    ]
-
-    return fig, table_data, columns
+    return fig
 
 
-
-
-# 750V820AEon & Eoff(IC)_E,create_loss_analysis_card4(),update_loss_analysis4()
+# 回調函數：L 卡片
 @app.callback(
-    [Output('loss_loss-graph4', 'figure'),
-     Output('loss_loss-table4', 'data'),
-     Output('loss_loss-table4', 'columns')],
-    [Input('loss_temperature-dropdown-graph4', 'value'),
-     Input('loss_ic-range-slider4', 'value'),
-     Input('loss_vce-range-slider4', 'value'),
-     Input('loss_temperature-dropdown-table4', 'value')]
+    Output('graph-extra5', 'figure'),
+    Input('upload-extra5', 'contents'),
+    State('upload-extra5', 'filename')
 )
-def update_loss_analysis4(selected_temp_graph, ic_range, vce_range, selected_temp_table):
-    print(f"update_loss_analysis4 triggered with: selected_temp_graph={selected_temp_graph}, ic_range={ic_range}, vce_range={vce_range}, selected_temp_table={selected_temp_table}")
+def update_graph_l(contents, filename):
+    if contents is None:
+        return go.Figure()
 
-    df = load_data(DATA_FILE_PATH4)
-    if df.empty:
-        print("DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "IC (A)", "id": "IC (A)"},
-            {"name": "VCE (V)", "id": "VCE (V)"},
-            {"name": "VCE2 (V)", "id": "VCE2 (V)"}
-        ]
-        return empty_fig, empty_data, empty_columns
+    # 解析上傳的數據
+    df = parse_contents(contents, filename)
 
-    # 過濾數據中的負值
-    df_filtered = df
-    print("U4-2305.")  # 調試輸出
-    # 假設 DATA_FILE_PATH 包含 Tj = 25°C, 150°C, 175°C 的數據
-    conditions = []
-    for temp in ['25℃', '150℃', '175℃']:
-        ic_col = f'IC(A)_{temp}'
-        print(f"U4 ic_col: {ic_col}")
-        vce_col = f'Eon(mJ)_{temp}'  # Eon card4
-        print(f"U4 Eon_col: {vce_col}")
-        vce_col2 = f'Eoff(mJ)_{temp}'  # Eoff card4
-        print(f"U4 Eoff_col: {vce_col2}")
-        if ic_col in df_filtered.columns and vce_col in df_filtered.columns and vce_col2 in df_filtered.columns:
-            conditions.append(
-                (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1]) &
-                (df_filtered[vce_col2] >= vce_range[0]) & (df_filtered[vce_col2] <= vce_range[1])
-            )
+    # 確保數據包含必要的欄位
+    required_columns = ['QG(μC)_25℃', 'VGE(V)_25℃']
+    if df is None or not all(col in df.columns for col in required_columns):
+        print("缺少必要的欄位:", required_columns)
+        return go.Figure()
 
-    if selected_temp_graph == 'ifvf_all_temperatures':
-        # 對所有溫度進行過濾
-        combined_condition = False
-        for condition in conditions:
-            combined_condition |= condition
-        df_filtered = df_filtered[combined_condition]
-        print(f"Filtered DataFrame for ifvf_all_temperatures: {df_filtered.shape[0]} rows.")  # 調試輸出
-    else:
-        temp_key = selected_temp_graph  # e.g., 'Tj_25C_IC_f_VCE'
-        # 從 temp_key 中提取溫度
-        temp_parts = temp_key.split('_')
-        if len(temp_parts) >= 3:
-            temp_str = temp_parts[1]  # '25C'
-            temp_str = temp_str.replace('C', '℃')  # '25℃'
-            ic_col = f'IC(A)_{temp_str}'
-            vce_col = f'Eon(mJ)_{temp_str}'
-            vce_col2 = f'Eoff(mJ)_{temp_str}'
-            if ic_col in df_filtered.columns and vce_col in df_filtered.columns and vce_col2 in df_filtered.columns:
-                df_filtered = df_filtered[
-                    (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                    (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1]) &
-                    (df_filtered[vce_col2] >= vce_range[0]) & (df_filtered[vce_col2] <= vce_range[1])
-                ]
-                print(f"Filtered DataFrame for {temp_key}: {df_filtered.shape[0]} rows.")  # 調試輸出
-            else:
-                print(f"Columns {ic_col} and/or {vce_col} and/or {vce_col2} not found in DataFrame.")  # 調試輸出
-                df_filtered = pd.DataFrame()  # 清空 DataFrame
-        else:
-            print(f"Unexpected temp_key format: {temp_key}")  # 調試輸出
-            df_filtered = pd.DataFrame()  # 清空 DataFrame
-
-    if df_filtered.empty:
-        print("Filtered DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "IC (A)", "id": "IC (A)"},
-            {"name": "VCE (V)", "id": "VCE (V)"},
-            {"name": "VCE2 (V)", "id": "VCE2 (V)"}
-        ]
-        return empty_fig, empty_data, empty_columns
-
-    # 初始化圖表
+    # 創建圖表
     fig = go.Figure()
 
-    # 整理數據
-    temperature_data = {
-        'Tj_25C_IC_f_VCE': {
-            'IC': df_filtered['IC(A)_25℃'].tolist(),
-            'VCE': df_filtered['Eon(mJ)_25℃'].tolist(),
-            'VCE2': df_filtered['Eoff(mJ)_25℃'].tolist(),
-            'Temperature': ['Tj = 25℃'] * len(df_filtered)
-        },
-        'Tj_150C_IC_f_VCE': {
-            'IC': df_filtered['IC(A)_150℃'].tolist(),
-            'VCE': df_filtered['Eon(mJ)_150℃'].tolist(),
-            'VCE2': df_filtered['Eoff(mJ)_150℃'].tolist(),
-            'Temperature': ['Tj = 150℃'] * len(df_filtered)
-        },
-        'Tj_175C_IC_f_VCE': {
-            'IC': df_filtered['IC(A)_175℃'].tolist(),
-            'VCE': df_filtered['Eon(mJ)_175℃'].tolist(),
-            'VCE2': df_filtered['Eoff(mJ)_175℃'].tolist(),
-            'Temperature': ['Tj = 175℃'] * len(df_filtered)
-        },
-    }
+    # 添加曲線
+    fig.add_trace(go.Scatter(
+        x=df['Q<sub>G</sub>(μC)_25℃'],
+        y=df['V<sub>GE</sub>(V)_25℃'],
+        mode='lines',
+        name='Gate Charge(QG)',  # 設置曲線名稱
+        line=dict(color='black', width=2)  # 黑色實線
+    ))
 
-    # 定義目標數據點（交換 x 和 y）
-    target_currents = {
-        'Tj_25C_IC_f_VCE': [
-            {'x': 447.51, 'y': 1.1547, 'text': "450A<br>IC: 447.51<br>VCE: 1.1547"},
-            {'x': 819.11, 'y': 1.3847, 'text': "820A<br>IC: 819.11<br>VCE: 1.3847"}
-        ],
-        'Tj_150C_IC_f_VCE': [
-            {'x': 451.644, 'y': 1.263, 'text': "450A<br>IC: 451.644<br>VCE: 1.263"},
-            {'x': 823.824, 'y': 1.678, 'text': "820A<br>IC: 823.824<br>VCE: 1.678"}
-        ],
-        'Tj_175C_IC_f_VCE': [
-            {'x': 450.026, 'y': 1.303, 'text': "450A<br>IC: 450.026<br>VCE: 1.303"},
-            {'x': 824.324, 'y': 1.764, 'text': "820A<br>IC: 824.324<br>VCE: 1.764"}
-        ]
-    }
-
-    # 定義顏色對應
-    color_mapping = {
-        'Tj_25C_IC_f_VCE': 'gray',
-        'Tj_150C_IC_f_VCE': 'skyblue',
-        'Tj_175C_IC_f_VCE': 'navy'
-    }
-
-    # 繪製曲線
-    for temp_key, data in temperature_data.items():
-        if selected_temp_graph == 'ifvf_all_temperatures' or temp_key == selected_temp_graph:
-            # 確保有數據
-            if not data['Temperature']:
-                print(f"No data for {temp_key}, skipping.")
-                continue
-
-            # 設置圖表模式
-            if selected_temp_graph == 'ifvf_all_temperatures':
-                mode_vce = 'lines'  # 不顯示標記點
-                mode_vce2 = 'lines'  # 不顯示標記點
-            else:
-                mode_vce = 'lines+markers'  # 顯示標記點
-                mode_vce2 = 'lines+markers'  # 顯示標記點
-
-            # 添加 VCE (V) 曲線
-            fig.add_trace(go.Scatter(
-                x=data['IC'],  # 交換後的 X 軸數據
-                y=data['VCE'],  # 交換後的 Y 軸數據
-                mode=mode_vce,
-                name=f"{data['Temperature'][0]} VCE",
-                line=dict(color=color_mapping[temp_key], width=2, dash='solid'),
-                marker=dict(size=6)
-            ))
-
-            # 添加 VCE2 (V) 曲線
-            fig.add_trace(go.Scatter(
-                x=data['IC'],  # 交換後的 X 軸數據
-                y=data['VCE2'],  # 交換後的 Y 軸數據
-                mode=mode_vce2,
-                name=f"{data['Temperature'][0]} VCE2",
-                line=dict(color=color_mapping[temp_key], width=2, dash='dash'),  # 使用虛線區分
-                marker=dict(size=6)
-            ))
-
-            # **新增：僅在非「所有溫度」時添加標註（交換 x 和 y）**
-            if selected_temp_graph != 'ifvf_all_temperatures':
-                for point in target_currents.get(temp_key, []):
-                    fig.add_annotation(
-                        x=point['x'], y=point['y'],
-                        text=point['text'],
-                        showarrow=True,
-                        arrowhead=2,
-                        ax=0,  # 箭頭的x坐標
-                        ay=-30,  # 箭頭的y坐標，距離標籤
-                        font=dict(size=12, color='black'),  # 將字體顏色設為黑色
-                        bgcolor='rgba(255, 255, 255, 0.7)',  # 半透明背景
-                        bordercolor='rgba(255, 255, 255, 0)',  # 無邊框顏色
-                        borderwidth=1,
-                        borderpad=4
-                    )
-
-    # 設置圖表布局（更新標題和軸標籤）
-    if selected_temp_graph != 'ifvf_all_temperatures':
-        title = f"Eon, Eoff vs IC for {selected_temp_graph.replace('_', ' ')}"
-    else:
-        title = "Eon, Eoff vs IC"  # 更新標題
-
+    # 更新圖表樣式
     fig.update_layout(
-        title=title,
-        xaxis_title="IC (A)",  # 更新 X 軸標籤
-        yaxis_title="E (mJ)",  # 更新 Y 軸標籤
-        margin=dict(l=40, r=40, t=60, b=40),  # 增加邊距
-        paper_bgcolor='white',  # 設置背景顏色為白色
-        plot_bgcolor='white',  # 設置圖表區域背景為白色
-        font=dict(
-            family="Arial, sans-serif",
-            size=14,
-            color="black"
-        ),
-        titlefont=dict(size=20, color='black'),  # 主標題字體大小和顏色
+        title="",  # 移除標題
+        xaxis_title="QG (μC)",  # x軸標籤
+        yaxis_title="VGE (V)",  # y軸標籤
+        margin=dict(l=50, r=20, t=10, b=50),  # 邊距調整
+        plot_bgcolor="white",  # 白色背景
+        font=dict(size=12),  # 字體大小
         xaxis=dict(
-            showgrid=True,  # 顯示網格線
-            gridcolor='lightgrey',  # 網格線顏色
-            tickmode='linear',
-            dtick=200,  # 設置刻度間隔為200
-            range=[0, 1800],  # 調整X軸範圍以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
+            showgrid=True, gridcolor='lightgray', gridwidth=1,
+            mirror=True, linecolor="black", linewidth=1,
+            ticks="inside", ticklen=5,
+            range=[0, 2], tickvals=[0.0, 0.4, 0.8, 1.2, 1.6, 2.0]  # 設定範圍
         ),
         yaxis=dict(
-            showgrid=True,
-            gridcolor='lightgrey',
-            tickmode='linear',
-            dtick=20,  # 根據新的 Y 軸數據調整刻度間隔
-            tick0=0,  # 設置起始刻度為0
-            range=[0, 140],  # 調整範圍為0到140V以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
+            showgrid=True, gridcolor='lightgray', gridwidth=1,
+            mirror=True, linecolor="black", linewidth=1,
+            ticks="inside", ticklen=5,
+            range=[-8, 16], tickvals=[-8, -4, 0, 4, 8, 12, 16]  # 設定範圍
         ),
         legend=dict(
-            x=1,
-            y=0.99,
-            bgcolor='rgba(255,255,255,0)',
-            bordercolor='rgba(0,0,0,0)'
-        )
+            title="",  # 移除圖例標題
+            x=0.02,  # x座標 (0 左邊, 1 右邊)
+            y=0.98,  # y座標 (0 底部, 1 頂部)
+            xanchor="left",  # x座標錨點
+            yanchor="top",   # y座標錨點
+            bgcolor="rgba(255, 255, 255, 0.8)",  # 半透明白色背景
+            bordercolor="black",  # 黑色邊框
+            borderwidth=1,  # 邊框寬度
+            font=dict(size=12),  # 字體大小
+            orientation="v",  # 垂直排列
+            traceorder="normal",  # 圖例順序
+        ),
+        showlegend=True  # 確保顯示圖例
     )
 
-    # 準備表格數據
-    table_data = []
-    if selected_temp_table == 'ifvf_all_temperatures':
-        for temp_key, data in temperature_data.items():
-            # 過濾掉 IC、VCE 或 VCE2 為 NaN 的行
-            valid_data = [
-                {
-                    '編號': idx + 1 + len(table_data),
-                    '溫度': temp,
-                    'IC (A)': f"{ic:.3f}",
-                    'VCE (V)': f"{vce:.4f}",
-                    'VCE2 (V)': f"{vce2:.4f}"
-                }
-                for idx, (temp, ic, vce, vce2) in enumerate(zip(data['Temperature'], data['IC'], data['VCE'], data['VCE2']))
-                if not (pd.isna(ic) or pd.isna(vce) or pd.isna(vce2))
-            ]
-            table_data.extend(valid_data)
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-            # 過濾掉 IC、VCE 或 VCE2 為 NaN 的行
-            table_data = [
-                {
-                    '編號': idx + 1,
-                    '溫度': temp,
-                    'IC (A)': f"{ic:.3f}",
-                    'VCE (V)': f"{vce:.4f}",
-                    'VCE2 (V)': f"{vce2:.4f}"
-                }
-                for idx, (temp, ic, vce, vce2) in enumerate(zip(temp_data['Temperature'], temp_data['IC'], temp_data['VCE'], temp_data['VCE2']))
-                if not (pd.isna(ic) or pd.isna(vce) or pd.isna(vce2))
-            ]
-        else:
-            table_data = []
-
-    # 定義表格欄位（保持不變）
-    columns = [
-        {"name": "Index", "id": "編號"},
-        {"name": "Temperature (°C)", "id": "溫度"},
-        {"name": "IC (A)", "id": "IC (A)"},
-        {"name": "EON (MJ)", "id": "VCE (V)"},
-        {"name": "EOFF (MJ)", "id": "VCE2 (V)"}
-    ]
-
-    return fig, table_data, columns
+    return fig
 
 
 
 
-# hi7582ifvf,create_loss_analysis_card3(),update_loss_analysis3()
+# M 卡片的回調函數
 @app.callback(
-    [Output('loss_loss-graph3', 'figure'),
-     Output('loss_loss-table3', 'data'),
-     Output('loss_loss-table3', 'columns')],
-    [Input('loss_temperature-dropdown-graph3', 'value'),
-     Input('loss_ic-range-slider3', 'value'),
-     Input('loss_vce-range-slider3', 'value'),
-     Input('loss_temperature-dropdown-table3', 'value')]
+    Output('graph-extra6', 'figure'),
+    Input('upload-extra6', 'contents'),
+    State('upload-extra6', 'filename')
 )
-def update_loss_analysis3(selected_temp_graph, ic_range, vce_range, selected_temp_table):
-    print(f"update_loss_analysis3 triggered with: selected_temp_graph={selected_temp_graph}, ic_range={ic_range}, vce_range={vce_range}, selected_temp_table={selected_temp_table}")
+def update_graph_m(contents, filename):
+    if contents is None:
+        return go.Figure()
 
-    df = load_data(DATA_FILE_PATH3)
-    if df.empty:
-        print("DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "IC (A)", "id": "IC (A)"},
-            {"name": "VCE (V)", "id": "VCE (V)"}
-        ]
-        return empty_fig, empty_data, empty_columns
+    # 解析上傳的數據
+    df = parse_contents(contents, filename)
 
-    # 過濾數據中的負值
-    df_filtered = df
-    print("U3-1825.")  # 調試輸出
-    # 假設 DATA_FILE_PATH 包含 Tj = 25°C, 150°C, 175°C 的數據
-    conditions = []
-    for temp in ['25℃', '150℃', '175℃']:
-        ic_col = f'If_{temp}'
-        print(f"U3 ic_col: {ic_col}")
-        vce_col = f'Vf_{temp}'
-        print(f"U3 vce_col: {vce_col}")
-        if ic_col in df_filtered.columns and vce_col in df_filtered.columns:
-            conditions.append(
-                (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1])
-            )
+    # 確保數據包含必要的欄位
+    required_columns = ['t [s]', 'Zth (t)']
+    if df is None or not all(col in df.columns for col in required_columns):
+        return go.Figure()
 
-    if selected_temp_graph == 'ifvf_all_temperatures':
-        # 對所有溫度進行過濾
-        combined_condition = False
-        for condition in conditions:
-            combined_condition |= condition
-        df_filtered = df_filtered[combined_condition]
-        print(f"Filtered DataFrame for ifvf_all_temperatures: {df_filtered.shape[0]} rows.")  # 調試輸出
-    else:
-        temp_key = selected_temp_graph  # e.g., 'Tj_25C_IC_f_VCE'
-        # 從 temp_key 中提取溫度
-        temp_parts = temp_key.split('_')
-        if len(temp_parts) >= 3:
-            temp_str = temp_parts[1]  # '25C'
-            temp_str = temp_str.replace('C', '℃')  # '25℃'
-            ic_col = f'If_{temp_str}'
-            vce_col = f'Vf_{temp_str}'
-            if ic_col in df_filtered.columns and vce_col in df_filtered.columns:
-                df_filtered = df_filtered[
-                    (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                    (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1])
-                ]
-                print(f"Filtered DataFrame for {temp_key}: {df_filtered.shape[0]} rows.")  # 調試輸出
-            else:
-                print(f"Columns {ic_col} and/or {vce_col} not found in DataFrame.")  # 調試輸出
-                df_filtered = pd.DataFrame()  # 清空 DataFrame
-        else:
-            print(f"Unexpected temp_key format: {temp_key}")  # 調試輸出
-            df_filtered = pd.DataFrame()  # 清空 DataFrame
-
-    # 初始化圖表
+    # 建立圖表
     fig = go.Figure()
 
-    # 整理數據
-    temperature_data = {
-        'Tj_25C_IC_f_VCE': {
-            'IC': df_filtered['If_25℃'].tolist(),
-            'VCE': df_filtered['Vf_25℃'].tolist(),
-            'Temperature': ['Tj = 25℃'] * len(df_filtered)
-        },
-        'Tj_150C_IC_f_VCE': {
-            'IC': df_filtered['If_150℃'].tolist(),
-            'VCE': df_filtered['Vf_150℃'].tolist(),
-            'Temperature': ['Tj = 150℃'] * len(df_filtered)
-        },
-        'Tj_175C_IC_f_VCE': {
-            'IC': df_filtered['If_175℃'].tolist(),
-            'VCE': df_filtered['Vf_175℃'].tolist(),
-            'Temperature': ['Tj = 175℃'] * len(df_filtered)
-        },
-    }
+    # 添加折線圖
+    fig.add_trace(go.Scatter(
+        x=df['t [s]'],
+        y=df['Zth (t)'],
+        mode='lines',
+        name='ZthJF : IGBT',
+        line=dict(color='black', width=2)  # 設定線條顏色與寬度
+    ))
 
-    # 定義目標數據點
-    target_currents = {
-        'Tj_25C_IC_f_VCE': [
-            {'x': 1.1547, 'y': 447.51, 'text': "450A<br>IC: 447.51<br>VCE: 1.1547"},
-            {'x': 1.3847, 'y': 819.11, 'text': "820A<br>IC: 819.11<br>VCE: 1.3847"}
-        ],
-        'Tj_150C_IC_f_VCE': [
-            {'x': 1.263, 'y': 451.644, 'text': "450A<br>IC: 451.644<br>VCE: 1.263"},
-            {'x': 1.678, 'y': 823.824, 'text': "820A<br>IC: 823.824<br>VCE: 1.678"}
-        ],
-        'Tj_175C_IC_f_VCE': [
-            {'x': 1.303, 'y': 450.026, 'text': "450A<br>IC: 450.026<br>VCE: 1.303"},
-            {'x': 1.764, 'y': 824.324, 'text': "820A<br>IC: 824.324<br>VCE: 1.764"}
-        ]
-    }
-
-    # 定義顏色對應
-    color_mapping = {
-        'Tj_25C_IC_f_VCE': 'gray',
-        'Tj_150C_IC_f_VCE': 'skyblue',
-        'Tj_175C_IC_f_VCE': 'navy'
-    }
-
-    # 繪製曲線
-    for temp_key, data in temperature_data.items():
-        if selected_temp_graph == 'ifvf_all_temperatures' or temp_key == selected_temp_graph:
-            # 設置圖表模式
-            if selected_temp_graph == 'ifvf_all_temperatures':
-                mode = 'lines'  # 不顯示標記點
-            else:
-                mode = 'lines+markers'  # 顯示標記點
-
-            fig.add_trace(go.Scatter(
-                x=data['VCE'],
-                y=data['IC'],
-                mode=mode,
-                name=data['Temperature'][0],
-                line=dict(color=color_mapping[temp_key], width=2),
-                marker=dict(size=4)  # 設置標記點大小為4
-            ))
-
-            # **新增：僅在非「所有溫度」時添加標註**
-            if selected_temp_graph != 'ifvf_all_temperatures':
-                for point in target_currents.get(temp_key, []):
-                    fig.add_annotation(
-                        x=point['x'], y=point['y'],
-                        text=point['text'],
-                        showarrow=True,
-                        arrowhead=2,
-                        ax=0,  # 箭頭的x坐標
-                        ay=-30,  # 箭頭的y坐標，距離標籤
-                        font=dict(size=12, color='black'),  # 將字體顏色設為黑色
-                        bgcolor='rgba(255, 255, 255, 0.7)',  # 半透明背景
-                        bordercolor='rgba(255, 255, 255, 0)',  # 無邊框顏色
-                        borderwidth=1,
-                        borderpad=4
-                    )
-
-    # 設置圖表布局
-    if selected_temp_graph != 'ifvf_all_temperatures':
-        title = f"IF vs VF for {selected_temp_graph.replace('_', ' ')}"
-    else:
-        title = "IF vs VF"  # 移除「所有溫度」的標籤
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="VF (V)",
-        yaxis_title="IF (A)",
-        margin=dict(l=40, r=40, t=60, b=40),  # 增加邊距
-        paper_bgcolor='white',  # 設置背景顏色為白色
-        plot_bgcolor='white',  # 設置圖表區域背景為白色
-        font=dict(
-            family="Arial, sans-serif",
-            size=14,
-            color="black"
-        ),
-        titlefont=dict(size=20, color='black'),  # 主標題字體大小和顏色
-        xaxis=dict(
-            showgrid=True,  # 顯示網格線
-            gridcolor='lightgrey',  # 網格線顏色
-            tickmode='linear',
-            dtick=0.8,  # 設置刻度間隔
-            range=[-1, 4],  # 調整範圍為-1到4V以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
-        ),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor='lightgrey',
-            tickmode='linear',
-            dtick=400,
-            tick0=-100,  # 設置起始刻度為 -100
-            range=[-100, 1700],  # 調整範圍以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
-        ),
-        legend=dict(
-            x=1,
-            y=0.99,
-            bgcolor='rgba(255,255,255,0)',
-            bordercolor='rgba(0,0,0,0)'
-        )
+    # 更新 x 軸與 y 軸的設定，使用對數刻度
+    fig.update_xaxes(
+        type="log",  # 設置對數刻度
+        title_text="tP (s)",  # x 軸標題
+        tickvals=[1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1],  # 主要刻度位置
+        ticktext=["1µ", "10µ", "100µ", "1m", "10m", "100m", "1", "10"],  # 刻度標籤
+        showgrid=True,  # 顯示網格線
+        gridcolor="lightgray"  # 網格線顏色
+    )
+    fig.update_yaxes(
+        type="log",  # 設置對數刻度
+        title_text="Zth (K/W)",  # y 軸標題
+        tickvals=[1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0],  # 主要刻度位置
+        ticktext=["10⁻⁵", "10⁻⁴", "10⁻³", "10⁻²", "10⁻¹", "1"],  # 刻度標籤
+        showgrid=True,  # 顯示網格線
+        gridcolor="lightgray"  # 網格線顏色
     )
 
-    # 準備表格數據
-    table_data = []
-    if selected_temp_table == 'ifvf_all_temperatures':
-        for temp_key, data in temperature_data.items():
-            # 過濾掉 IC 或 VCE 為 NaN 的行
-            valid_data = [
-                {'編號': idx + 1 + len(table_data), '溫度': temp, 'IF (A)': ic, 'VF (V)': vce}
-                for idx, (temp, ic, vce) in enumerate(zip(data['Temperature'], data['IC'], data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-            table_data.extend(valid_data)
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-            # 過濾掉 IC 或 VCE 為 NaN 的行
-            table_data = [
-                {'編號': idx + 1, '溫度': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                for idx, (temp, ic, vce) in enumerate(zip(temp_data['Temperature'], temp_data['IC'], temp_data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-        else:
-            temp_data = {'IC': [], 'VCE': [], 'Temperature': []}
-            table_data = []
+    # 更新圖表佈局
+    fig.update_layout(
+        title="ZthJF vs tP",  # 圖表標題
+        xaxis_title="t<sub>P</sub> (s)",  # x 軸標題
+        yaxis_title="Z<sub>th</sub> (K/W)",  # y 軸標題
+        showlegend=True,  # 顯示圖例
+        margin=dict(l=20, r=20, t=30, b=20),  # 圖表邊距
+        plot_bgcolor="white",  # 背景顏色
+        xaxis=dict(showgrid=True, gridcolor='lightgray'),  # x 軸網格線
+        yaxis=dict(showgrid=True, gridcolor='lightgray'),  # y 軸網格線
+    )
 
-    # 定義表格欄位
-    columns = [
-        {"name": "Index", "id": "編號", "type": "numeric"},
-        {"name": "Temperature (°C)", "id": "溫度", "type": "text"},
-        {"name": "IF (A)", "id": "IC (A)", "type": "numeric"},
-        {"name": "VF (V)", "id": "VCE (V)", "type": "numeric"}
-    ]
-
-    if selected_temp_table == 'ifvf_all_temperatures':
-        # Concatenate all temperatures' data
-        table_data = []
-
-        for temp_key, data in temperature_data.items():
-            ic_values = [f"{ic:.3f}" for ic in data['IC']]
-            vce_values = [f"{vce:.4f}" for vce in data['VCE']]
-            temp_values = data['Temperature']
-            table_data.extend([{'編號': idx + 1 + len(table_data), '溫度': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                               for idx, (temp, ic, vce) in enumerate(zip(temp_values, ic_values, vce_values))])
-
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-        else:
-            temp_data = {'IC': [], 'VCE': [], 'Temperature': []}
-
-        ic_values = [f"{ic:.3f}" for ic in temp_data['IC']]  # 保留IC數值小數點後三位
-        vce_values = [f"{vce:.4f}" for vce in temp_data['VCE']]  # 保留VCE數值小數點後四位
-        temp_values = temp_data['Temperature']
-
-        # 構建表格數據
-        table_data = [{'編號': idx + 1, '溫度': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                      for idx, (temp, ic, vce) in enumerate(zip(temp_values, ic_values, vce_values))]
-
-    # 定義表格欄位（保持不變）
-    columns = [
-        {"name": "Index", "id": "編號"},
-        {"name": "Temperature (°C)", "id": "溫度"},
-        {"name": "IF (A)", "id": "IC (A)"},
-        {"name": "VF (V)", "id": "VCE (V)"}
-    ]
-
-    return fig, table_data, columns
+    return fig
 
 
-
-
-# Callback for Characteristics Diagrams (Tab1)
+# N卡片的回調函數
 @app.callback(
-    [Output('loss_loss-graph', 'figure'),
-     Output('loss_loss-table', 'data'),
-     Output('loss_loss-table', 'columns')],
-    [Input('loss_temperature-dropdown-graph', 'value'),
-     Input('loss_ic-range-slider', 'value'),
-     Input('loss_vce-range-slider', 'value'),
-     Input('loss_temperature-dropdown-table', 'value')]
+    Output('graph-extra7', 'figure'),
+    Input('upload-extra7', 'contents'),
+    State('upload-extra7', 'filename')
 )
-def update_loss_analysis(selected_temp_graph, ic_range, vce_range, selected_temp_table):
-    print(f"update_loss_analysis triggered with: selected_temp_graph={selected_temp_graph}, ic_range={ic_range}, vce_range={vce_range}, selected_temp_table={selected_temp_table}")
+def update_graph_n(contents, filename):
+    if contents is None:
+        return go.Figure()
 
-    df = load_data(DATA_FILE_PATH)
-    if df.empty:
-        print("DataFrame is empty.")  # 調試輸出
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Temperature (°C)", "id": "溫度"},
-            {"name": "IC (A)", "id": "IC (A)"},
-            {"name": "VCE (V)", "id": "VCE (V)"}
-        ]
-        return empty_fig, empty_data, empty_columns
+    # 解析上傳的數據
+    df = parse_contents(contents, filename)
 
-    # 過濾數據中的負值
-    df_filtered = df
+    # 確保數據包含必要的欄位
+    required_columns = ['t [s]', 'Zth (t)']
+    if df is None or not all(col in df.columns for col in required_columns):
+        return go.Figure()
 
-    # 假設 DATA_FILE_PATH 包含 Tj = 25°C, 150°C, 175°C 的數據
-    conditions = []
-    for temp in ['25℃', '150℃', '175℃']:
-        ic_col = f'IC_Tj = {temp}'
-        vce_col = f'VCE_Tj = {temp}'
-        if ic_col in df_filtered.columns and vce_col in df_filtered.columns:
-            conditions.append(
-                (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1])
-            )
-
-    if selected_temp_graph == 'all_temperatures':
-        # 對所有溫度進行過濾
-        combined_condition = False
-        for condition in conditions:
-            combined_condition |= condition
-        df_filtered = df_filtered[combined_condition]
-        print(f"Filtered DataFrame for all_temperatures: {df_filtered.shape[0]} rows.")  # 調試輸出
-    else:
-        temp_key = selected_temp_graph  # e.g., 'Tj_25C_IC_f_VCE'
-        # 從 temp_key 中提取溫度
-        temp_parts = temp_key.split('_')
-        if len(temp_parts) >= 3:
-            temp_str = temp_parts[1]  # '25C'
-            temp_str = temp_str.replace('C', '℃')  # '25℃'
-            ic_col = f'IC_Tj = {temp_str}'
-            vce_col = f'VCE_Tj = {temp_str}'
-            if ic_col in df_filtered.columns and vce_col in df_filtered.columns:
-                df_filtered = df_filtered[
-                    (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                    (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1])
-                ]
-                print(f"Filtered DataFrame for {temp_key}: {df_filtered.shape[0]} rows.")  # 調試輸出
-            else:
-                print(f"Columns {ic_col} and/or {vce_col} not found in DataFrame.")  # 調試輸出
-                df_filtered = pd.DataFrame()  # 清空 DataFrame
-        else:
-            print(f"Unexpected temp_key format: {temp_key}")  # 調試輸出
-            df_filtered = pd.DataFrame()  # 清空 DataFrame
-
-    # 初始化圖表
+    # 建立圖表
     fig = go.Figure()
 
-    # 整理數據
-    temperature_data = {
-        'Tj_25C_IC_f_VCE': {
-            'IC': df_filtered['IC_Tj = 25℃'].tolist(),
-            'VCE': df_filtered['VCE_Tj = 25℃'].tolist(),
-            'Temperature': ['Tj = 25℃'] * len(df_filtered)
-        },
-        'Tj_150C_IC_f_VCE': {
-            'IC': df_filtered['IC_Tj = 150℃'].tolist(),
-            'VCE': df_filtered['VCE_Tj = 150℃'].tolist(),
-            'Temperature': ['Tj = 150℃'] * len(df_filtered)
-        },
-        'Tj_175C_IC_f_VCE': {
-            'IC': df_filtered['IC_Tj = 175℃'].tolist(),
-            'VCE': df_filtered['VCE_Tj = 175℃'].tolist(),
-            'Temperature': ['Tj = 175℃'] * len(df_filtered)
-        },
-    }
+    # 添加折線圖
+    fig.add_trace(go.Scatter(
+        x=df['t<sub>p</sub> [s]'],
+        y=df['Z<sub>th</sub> (t)'],
+        mode='lines',
+        name='ZthJF : Diode',
+        line=dict(color='black', width=2)  # 設定線條顏色與寬度
+    ))
 
-    # 定義目標數據點
-    target_currents = {
-        'Tj_25C_IC_f_VCE': [
-            {'x': 1.1547, 'y': 447.51, 'text': "450A<br>IC: 447.51<br>VCE: 1.1547"},
-            {'x': 1.3847, 'y': 819.11, 'text': "820A<br>IC: 819.11<br>VCE: 1.3847"}
-        ],
-        'Tj_150C_IC_f_VCE': [
-            {'x': 1.263, 'y': 451.644, 'text': "450A<br>IC: 451.644<br>VCE: 1.263"},
-            {'x': 1.678, 'y': 823.824, 'text': "820A<br>IC: 823.824<br>VCE: 1.678"}
-        ],
-        'Tj_175C_IC_f_VCE': [
-            {'x': 1.303, 'y': 450.026, 'text': "450A<br>IC: 450.026<br>VCE: 1.303"},
-            {'x': 1.764, 'y': 824.324, 'text': "820A<br>IC: 824.324<br>VCE: 1.764"}
-        ]
-    }
-
-    # 定義顏色對應
-    color_mapping = {
-        'Tj_25C_IC_f_VCE': 'gray',
-        'Tj_150C_IC_f_VCE': 'skyblue',
-        'Tj_175C_IC_f_VCE': 'navy'
-    }
-
-    # 繪製曲線
-    for temp_key, data in temperature_data.items():
-        if selected_temp_graph == 'all_temperatures' or temp_key == selected_temp_graph:
-            # 設置圖表模式
-            if selected_temp_graph == 'all_temperatures':
-                mode = 'lines'  # 不顯示標記點
-            else:
-                mode = 'lines+markers'  # 顯示標記點
-
-            fig.add_trace(go.Scatter(
-                x=data['VCE'],
-                y=data['IC'],
-                mode=mode,
-                name=data['Temperature'][0],
-                line=dict(color=color_mapping[temp_key], width=2),
-                marker=dict(size=4)  # 設置標記點大小為4
-            ))
-
-            # **新增：僅在非「所有溫度」時添加標註**
-            if selected_temp_graph != 'all_temperatures':
-                for point in target_currents.get(temp_key, []):
-                    fig.add_annotation(
-                        x=point['x'], y=point['y'],
-                        text=point['text'],
-                        showarrow=True,
-                        arrowhead=2,
-                        ax=0,  # 箭頭的x坐標
-                        ay=-30,  # 箭頭的y坐標，距離標籤
-                        font=dict(size=12, color='black'),  # 將字體顏色設為黑色
-                        bgcolor='rgba(255, 255, 255, 0.7)',  # 半透明背景
-                        bordercolor='rgba(255, 255, 255, 0)',  # 無邊框顏色
-                        borderwidth=1,
-                        borderpad=4
-                    )
-
-    # 設置圖表布局
-    if selected_temp_graph != 'all_temperatures':
-        title = f"IC vs VCE for {selected_temp_graph.replace('_', ' ')}"
-    else:
-        title = "IC vs VCE"  # 移除「所有溫度」的標籤
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="VCE (V)",
-        yaxis_title="IC (A)",
-        margin=dict(l=40, r=40, t=60, b=40),  # 增加邊距
-        paper_bgcolor='white',  # 設置背景顏色為白色
-        plot_bgcolor='white',  # 設置圖表區域背景為白色
-        font=dict(
-            family="Arial, sans-serif",
-            size=14,
-            color="black"
-        ),
-        titlefont=dict(size=20, color='black'),  # 主標題字體大小和顏色
-        xaxis=dict(
-            showgrid=True,  # 顯示網格線
-            gridcolor='lightgrey',  # 網格線顏色
-            tickmode='linear',
-            dtick=0.8,  # 設置刻度間隔
-            range=[-1, 4],  # 調整範圍為-1到4V以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
-        ),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor='lightgrey',
-            tickmode='linear',
-            dtick=400,
-            tick0=-100,  # 設置起始刻度為 -100
-            range=[-100, 1700],  # 調整範圍以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
-        ),
-        legend=dict(
-            x=1,
-            y=0.99,
-            bgcolor='rgba(255,255,255,0)',
-            bordercolor='rgba(0,0,0,0)'
-        )
+    # 更新 x 軸與 y 軸的設定，使用對數刻度
+    fig.update_xaxes(
+        type="log",  # 設置對數刻度
+        title_text="tP (s)",  # x 軸標題
+        tickvals=[1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1],  # 主要刻度位置
+        ticktext=["1µ", "10µ", "100µ", "1m", "10m", "100m", "1", "10"],  # 刻度標籤
+        showgrid=True,  # 顯示網格線
+        gridcolor="lightgray"  # 網格線顏色
+    )
+    fig.update_yaxes(
+        type="log",  # 設置對數刻度
+        title_text="Zth (K/W)",  # y 軸標題
+        tickvals=[1e-4, 1e-3, 1e-2, 1e-1, 1e0],  # 主要刻度位置
+        ticktext=["10⁻⁴", "10⁻³", "10⁻²", "10⁻¹", "1"],  # 刻度標籤
+        showgrid=True,  # 顯示網格線
+        gridcolor="lightgray"  # 網格線顏色
     )
 
-    # 準備表格數據
-    table_data = []
-    if selected_temp_table == 'all_temperatures':
-        for temp_key, data in temperature_data.items():
-            # 過濾掉 IC 或 VCE 為 NaN 的行
-            valid_data = [
-                {'編號': idx + 1 + len(table_data), '溫度': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                for idx, (temp, ic, vce) in enumerate(zip(data['Temperature'], data['IC'], data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-            table_data.extend(valid_data)
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-            # 過濾掉 IC 或 VCE 為 NaN 的行
-            table_data = [
-                {'編號': idx + 1, '溫度': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                for idx, (temp, ic, vce) in enumerate(zip(temp_data['Temperature'], temp_data['IC'], temp_data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-        else:
-            temp_data = {'IC': [], 'VCE': [], 'Temperature': []}
-            table_data = []
+    # 更新圖表佈局
+    fig.update_layout(
+        title="ZthJF vs tP (Diode)",  # 圖表標題
+        xaxis_title="tP (s)",  # x 軸標題
+        yaxis_title="Zth (K/W)",  # y 軸標題
+        showlegend=True,  # 顯示圖例
+        margin=dict(l=20, r=20, t=30, b=20),  # 圖表邊距
+        plot_bgcolor="white",  # 背景顏色
+        xaxis=dict(showgrid=True, gridcolor='lightgray'),  # x 軸網格線
+        yaxis=dict(showgrid=True, gridcolor='lightgray'),  # y 軸網格線
+    )
 
-    # 定義表格欄位
-    columns = [
-        {"name": "Index", "id": "編號", "type": "numeric"},
-        {"name": "Temperature (°C)", "id": "溫度", "type": "text"},
-        {"name": "IC (A)", "id": "IC (A)", "type": "numeric"},
-        {"name": "VCE (V)", "id": "VCE (V)", "type": "numeric"}
-    ]
+    return fig
 
-    if selected_temp_table == 'all_temperatures':
-        # Concatenate all temperatures' data
-        table_data = []
-
-        for temp_key, data in temperature_data.items():
-            ic_values = [f"{ic:.3f}" for ic in data['IC']]
-            vce_values = [f"{vce:.4f}" for vce in data['VCE']]
-            temp_values = data['Temperature']
-            table_data.extend([{'編號': idx + 1 + len(table_data), '溫度': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                               for idx, (temp, ic, vce) in enumerate(zip(temp_values, ic_values, vce_values))])
-
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-        else:
-            temp_data = {'IC': [], 'VCE': [], 'Temperature': []}
-
-        ic_values = [f"{ic:.3f}" for ic in temp_data['IC']]  # 保留IC數值小數點後三位
-        vce_values = [f"{vce:.4f}" for vce in temp_data['VCE']]  # 保留VCE數值小數點後四位
-        temp_values = temp_data['Temperature']
-
-        # 構建表格數據
-        table_data = [{'編號': idx + 1, '溫度': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                      for idx, (temp, ic, vce) in enumerate(zip(temp_values, ic_values, vce_values))]
-
-    # 定義表格欄位（保持不變）
-    columns = [
-        {"name": "Index", "id": "編號"},
-        {"name": "Temperature (°C)", "id": "溫度"},
-        {"name": "IC (A)", "id": "IC (A)"},
-        {"name": "VCE (V)", "id": "VCE (V)"}
-    ]
-
-    return fig, table_data, columns
-
-# Callback for Characteristics Diagrams2 (Tab1-2)
+# 回調函數：處理 CSV Data 模態窗口
 @app.callback(
-    [Output('loss_loss-graph2', 'figure'),
-     Output('loss_loss-table2', 'data'),
-     Output('loss_loss-table2', 'columns')],
-    [Input('icvce-radio2', 'value'),
-     Input('loss_temperature-dropdown-graph2', 'value'),
-     Input('loss_ic-range-slider2', 'value'),
-     Input('loss_vce-range-slider2', 'value'),
-     Input('loss_temperature-dropdown-table2', 'value')]
+    [Output("data-modal", "is_open"),
+     Output("modal-body", "children")],
+    [
+        Input({'type': 'Data', 'index': ALL}, 'n_clicks'),
+        Input("close-modal", "n_clicks")
+    ],
+    [
+        # 所有 upload 的 contents 和 filename
+        State('upload-tj25', 'contents'),
+        State('upload-tj150', 'contents'),
+        State('upload-tj175', 'contents'),
+        State('upload-tjD', 'contents'),
+        State('upload-tjE', 'contents'),
+        State('upload-tjF', 'contents'),
+        State('upload-tjG', 'contents'),
+        State('upload-extra1', 'contents'),
+        State('upload-extra2', 'contents'),
+        State('upload-extra3', 'contents'),
+        State('upload-extra4', 'contents'),
+        State('upload-extra5', 'contents'),
+        State('upload-extra6', 'contents'),
+        State('upload-extra7', 'contents'),
+        State('upload-tj25', 'filename'),
+        State('upload-tj150', 'filename'),
+        State('upload-tj175', 'filename'),
+        State('upload-tjD', 'filename'),
+        State('upload-tjE', 'filename'),
+        State('upload-tjF', 'filename'),
+        State('upload-tjG', 'filename'),
+        State('upload-extra1', 'filename'),
+        State('upload-extra2', 'filename'),
+        State('upload-extra3', 'filename'),
+        State('upload-extra4', 'filename'),
+        State('upload-extra5', 'filename'),
+        State('upload-extra6', 'filename'),
+        State('upload-extra7', 'filename'),
+    ]
 )
-def update_loss_analysis2(selected_radio, selected_temp_graph, ic_range, vce_range, selected_temp_table):
-    print(f"update_loss_analysis2 triggered with: selected_radio={selected_radio}, selected_temp_graph={selected_temp_graph}, ic_range={ic_range}, vce_range={vce_range}, selected_temp_table={selected_temp_table}")
+def toggle_modal(Data_n_clicks, close_n_clicks,
+                contents_tj25, contents_tj150, contents_tj175,
+                contents_tjD, contents_tjE, contents_tjF,
+                contents_tjG, contents_extra1, contents_extra2,
+                contents_extra3, contents_extra4, contents_extra5,
+                contents_extra6, contents_extra7,
+                filenames_tj25, filenames_tj150, filenames_tj175,
+                filenames_tjD, filenames_tjE, filenames_tjF,
+                filenames_tjG, filenames_extra1, filenames_extra2,
+                filenames_extra3, filenames_extra4, filenames_extra5,
+                filenames_extra6, filenames_extra7):
+    ctx = dash.callback_context
 
-    # 根據選擇的 Radio 按鈕設置 file 路徑
-    if selected_radio == 'Tj_25C_IC_f_VCE':
-        file_path = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AIC_VCE_family_25C_B.csv'
-    elif selected_radio == 'Tj_150C_IC_f_VCE':
-        file_path = '/Users/helen/PycharmProjects/Simulation_Tools/data/750V820AIC_VCE_family_150C_C.csv'
+    if not ctx.triggered:
+        return False, ""
     else:
-        # 默認路徑或處理其他選項
-        file_path = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/refs/heads/main/750V820AIC_VCE_family_25C_B.csv'
+        triggered_prop_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
-    # 讀取 CSV 文件
+        try:
+            # 嘗試解析為 JSON dict
+            triggered_id = json.loads(triggered_prop_id)
+        except json.JSONDecodeError:
+            # 如果無法解析，則為簡單的字符串 ID
+            triggered_id = triggered_prop_id
+
+        if triggered_id == "close-modal":
+            return False, ""
+        elif isinstance(triggered_id, dict) and triggered_id.get('type') == 'Data':
+            index = triggered_id.get('index')  # 例如 'graph-tj25'
+            # 更新 contents_map 使用 graph_id 作為鍵
+            contents_map = {
+                'graph-tj25': (contents_tj25, filenames_tj25),
+                'graph-tj150': (contents_tj150, filenames_tj150),
+                'graph-tj175': (contents_tj175, filenames_tj175),
+                'graph-tjD': (contents_tjD, filenames_tjD),
+                'graph-tjE': (contents_tjE, filenames_tjE),
+                'graph-tjF': (contents_tjF, filenames_tjF),
+                'graph-tjG': (contents_tjG, filenames_tjG),
+                'graph-extra1': (contents_extra1, filenames_extra1),
+                'graph-extra2': (contents_extra2, filenames_extra2),
+                'graph-extra3': (contents_extra3, filenames_extra3),
+                'graph-extra4': (contents_extra4, filenames_extra4),
+                'graph-extra5': (contents_extra5, filenames_extra5),
+                'graph-extra6': (contents_extra6, filenames_extra6),
+                'graph-extra7': (contents_extra7, filenames_extra7),
+            }
+
+            contents, filename = contents_map.get(index, (None, None))
+            if contents is not None:
+                df_modal = parse_contents(contents, filename)
+                if df_modal is not None:
+                    # 移除全為空的欄位和列
+                    df_clean = df_modal.dropna(axis=1, how='all').dropna(axis=0, how='all')
+
+                    # 將清理後的 DataFrame 轉換為表格
+                    table = dbc.Table.from_dataframe(df_clean, striped=True, bordered=True, hover=True, size="sm")
+                    return True, table
+            return False, ""
+        else:
+            return dash.no_update
+
+# 定義回調函數：下載圖表圖片
+@app.callback(
+    Output('download-image', 'data'),
+    [
+        Input({'type': 'button2', 'graph_id': 'graph-tj25'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-tj150'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-tj175'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-tjD'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-tjE'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-tjF'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-tjG'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-extra1'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-extra2'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-extra3'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-extra4'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-extra5'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-extra6'}, 'n_clicks'),
+        Input({'type': 'button2', 'graph_id': 'graph-extra7'}, 'n_clicks'),
+    ],
+    [
+        State('graph-tj25', 'figure'),
+        State('graph-tj150', 'figure'),
+        State('graph-tj175', 'figure'),
+        State('graph-tjD', 'figure'),
+        State('graph-tjE', 'figure'),
+        State('graph-tjF', 'figure'),
+        State('graph-tjG', 'figure'),
+        State('graph-extra1', 'figure'),
+        State('graph-extra2', 'figure'),
+        State('graph-extra3', 'figure'),
+        State('graph-extra4', 'figure'),
+        State('graph-extra5', 'figure'),
+        State('graph-extra6', 'figure'),
+        State('graph-extra7', 'figure'),
+    ],
+    prevent_initial_call=True
+)
+def download_graph(*args):
+    # 分離 Inputs 和 States
+    input_n_clicks = args[:14]
+    states = args[14:]
+
+    # 使用 callback_context 來確定哪個按鈕被點擊
+    ctx = dash.callback_context
+
+    if not ctx.triggered:
+        raise PreventUpdate
+    else:
+        triggered_prop_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        try:
+            triggered_id = json.loads(triggered_prop_id)
+        except json.JSONDecodeError:
+            triggered_id = None
+
+        if isinstance(triggered_id, dict) and triggered_id.get('type') == 'button2':
+            graph_id = triggered_id.get('graph_id')
+            # Map graph_id 到對應的 figure
+            graph_map = {
+                'graph-tj25': states[0],
+                'graph-tj150': states[1],
+                'graph-tj175': states[2],
+                'graph-tjD': states[3],
+                'graph-tjE': states[4],
+                'graph-tjF': states[5],
+                'graph-tjG': states[6],
+                'graph-extra1': states[7],
+                'graph-extra2': states[8],
+                'graph-extra3': states[9],
+                'graph-extra4': states[10],
+                'graph-extra5': states[11],
+                'graph-extra6': states[12],
+                'graph-extra7': states[13],
+            }
+
+            figure = graph_map.get(graph_id)
+            if figure:
+                # 使用 Plotly 的 to_image 生成 PNG 圖片
+                img_bytes = go.Figure(figure).to_image(format="png")
+                # 傳送圖片進行下載
+                return dcc.send_bytes(img_bytes, filename=f"{graph_id}.png")
+
+    raise PreventUpdate
+
+# ================== Diagrams1 的整合結束 ==================
+
+# 定義回調函數：啟動 subprocess（Diagrams2 頁面）
+@app.callback(
+    Output("subprocess-feedback", "children"),
+    Input("url", "pathname"),
+    prevent_initial_call=True
+)
+def run_subprocess(pathname):
+    if pathname == '/diagrams2':
+        try:
+            # 檢查是否已經有該子進程在運行
+            # 您可以使用更複雜的機制來管理子進程，例如儲存進程 ID
+            subprocess.Popen(["python", "hh4any.py"])
+            return "hh4any.py 已經在後台啟動 (port=8051?) ，請另開瀏覽器視窗查看。"
+        except Exception as e:
+            logging.error(f"啟動 hh4any.py 失敗: {e}")
+            return f"啟動 hh4any.py 失敗: {e}"
+    return ""
+
+# 定義應用的整體佈局
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False),
+    dcc.Store(id="store-selected", data={}),
+    navbar,
+    html.Div(id='page-content', style={'padding': '0 20px'})  # 調整間距以達到與上方標題緊密相連的效果
+])
+
+# 定義回調函數：啟動 subprocess 僅在訪問 Diagrams2 時
+# 已經在 run_subprocess 中處理
+
+# 最後執行 Dash 應用程式
+if __name__ == "__main__":
     try:
-        df = pd.read_csv(file_path)
-        print(f"CSV 文件 {file_path} 讀取成功，包含 {df.shape[0]} 行和 {df.shape[1]} 列。")
-    except Exception as e:
-        print(f"讀取 CSV 文件時出錯：{e}")
-        # 返回空的圖表和表格
-        empty_fig = go.Figure()
-        empty_data = []
-        empty_columns = [
-            {"name": "Index", "id": "編號"},
-            {"name": "Voltage (V)", "id": "Voltage (V)"},
-            {"name": "IC (A)", "id": "IC (A)"},
-            {"name": "VCE (V)", "id": "VCE (V)"}
-        ]
-        return empty_fig, empty_data, empty_columns
-
-    # 數據處理
-    df_filtered = df.copy()
-
-    # 假設 CSV 文件有 'IC_9V', 'VCE_9V', etc. 的列
-    temp_key = selected_temp_graph  # e.g., 'IC_9V_VCE_9V'
-    print(f"temp_key format: {temp_key}")
-    if temp_key != 'all_voltages':
-        parts = temp_key.split('_')  # ['IC', '9V', 'VCE', '9V']
-        if len(parts) >= 4:
-            ic_col = f"{parts[0]}_{parts[1]}"  # 'IC_9V'
-            vce_col = f"{parts[2]}_{parts[3]}"  # 'VCE_9V'
-            if ic_col in df_filtered.columns and vce_col in df_filtered.columns:
-                df_filtered = df_filtered[
-                    (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                    (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1])
-                ]
-                print(f"Filtered DataFrame for {temp_key}: {df_filtered.shape[0]} rows.")  # 調試輸出
+        # 檢查公司 PDF 文件
+        missing_company_pdfs = []
+        for label, path in company_pdfs.items():
+            # 若 path 是 URL，直接檢查 HTTP 狀態
+            if path.startswith("http://") or path.startswith("https://"):
+                try:
+                    response = requests.head(path, allow_redirects=True, timeout=5)
+                    if response.status_code != 200:
+                        logging.error(f"公司 PDF 文件缺失: {path} (HTTP status code: {response.status_code})")
+                        missing_company_pdfs.append(path)
+                except Exception as e:
+                    logging.error(f"公司 PDF 文件檢查失敗: {path} ({e})")
+                    missing_company_pdfs.append(path)
             else:
-                print(f"Columns {ic_col} and/or {vce_col} not found in DataFrame.")  # 調試輸出
-                df_filtered = pd.DataFrame()  # 清空 DataFrame
+                # 本地檔案，組合路徑檢查
+                file_path = os.path.join(os.getcwd(), path)
+                if not os.path.exists(file_path):
+                    logging.error(f"公司 PDF 文件缺失: {file_path}")
+                    missing_company_pdfs.append(file_path)
+
+        if missing_company_pdfs:
+            raise FileNotFoundError(f"以下公司 PDF 文件缺失: {missing_company_pdfs}")
         else:
-            print(f"Unexpected temp_key format: {temp_key}")  # 調試輸出
-            df_filtered = pd.DataFrame()  # 清空 DataFrame
-    else:
-        # 對所有電壓進行過濾
-        ic_cols = [col for col in df_filtered.columns if col.startswith('IC_')]
-        vce_cols = [col for col in df_filtered.columns if col.startswith('VCE_')]
-        condition = False
-        for ic_col, vce_col in zip(ic_cols, vce_cols):
-            condition |= (
-                (df_filtered[ic_col] >= ic_range[0]) & (df_filtered[ic_col] <= ic_range[1]) &
-                (df_filtered[vce_col] >= vce_range[0]) & (df_filtered[vce_col] <= vce_range[1])
-            )
-        df_filtered = df_filtered[condition]
-        print(f"Filtered DataFrame for all_voltages: {df_filtered.shape[0]} rows.")  # 調試輸出
+            logging.info("所有公司 PDF 文件均存在。")
 
-    if temp_key == 'all_voltages':
-        # 準備所有電壓的數據
-        temperature_data = {}
-        for ic_col, vce_col in zip([col for col in df.columns if col.startswith('IC_')],
-                                   [col for col in df.columns if col.startswith('VCE_')]):
-            temp_label = ic_col.split('_')[1]  # '9V'
-            temperature_data[ic_col + '_' + vce_col] = {
-                'IC': df_filtered[ic_col].tolist(),
-                'VCE': df_filtered[vce_col].tolist(),
-                'Temperature': [temp_label] * len(df_filtered)
-            }
-    else:
-        # 準備特定電壓的數據
-        temperature_data = {
-            temp_key: {
-                'IC': df_filtered[f'{parts[0]}_{parts[1]}'].tolist(),
-                'VCE': df_filtered[f'{parts[2]}_{parts[3]}'].tolist(),
-                'Temperature': [parts[1]] * len(df_filtered)
-            }
-        }
-
-    # 定義需要標記的條件
-    highlight_conditions = [
-        {'Voltage (V)': '11V', 'IC (A)': 443.24},
-        {'Voltage (V)': '11V', 'IC (A)': 813.68},
-        {'Voltage (V)': '13V', 'IC (A)': 500.00},
-        {'Voltage (V)': '13V', 'IC (A)': 900.00},
-        {'Voltage (V)': '15V', 'IC (A)': 500.00},
-        {'Voltage (V)': '15V', 'IC (A)': 900.00},
-        {'Voltage (V)': '17V', 'IC (A)': 500.00},
-        {'Voltage (V)': '17V', 'IC (A)': 900.00},
-        {'Voltage (V)': '19V', 'IC (A)': 500.00},
-        {'Voltage (V)': '19V', 'IC (A)': 900.00},
-    ]
-
-    # 生成 style_data_conditional
-    style_data_conditional = [
-        {
-            'if': {
-                'filter_query': f'{{Voltage (V)}} = "{cond["Voltage (V)"]}" && {{IC (A)}} = {cond["IC (A)"]}',
-            },
-            'backgroundColor': 'lightgreen',  # 不同顏色以區分
-            'color': 'black'
-        }
-        for cond in highlight_conditions
-    ]
-
-    # 準備繪圖數據
-    target_currents = {
-        'IC_11V_VCE_11V': [
-            {'x': 1.203, 'y': 443.242, 'text': "450A<br>IC: 443.242<br>VCE: 1.203"},
-            {'x': 1.486, 'y': 813.684, 'text': "820A<br>IC: 813.684<br>VCE: 1.486"}
-        ],
-        'IC_13V_VCE_13V': [
-            {'x': 1.173, 'y': 446.866, 'text': "450A<br>IC: 446.866<br>VCE: 1.173"},
-            {'x': 1.420, 'y': 819.316, 'text': "820A<br>IC: 819.316<br>VCE: 1.420"}
-        ],
-        'IC_15V_VCE_15V': [
-            {'x': 1.154, 'y': 447.51, 'text': "450A<br>IC: 447.510<br>VCE: 1.154"},
-            {'x': 1.384, 'y': 819.11, 'text': "820A<br>IC: 819.110<br>VCE: 1.384"}
-        ],
-        'IC_17V_VCE_17V': [
-            {'x': 1.144, 'y': 447.714, 'text': "450A<br>IC: 447.714<br>VCE: 1.144"},
-            {'x': 1.361, 'y': 818.736, 'text': "820A<br>IC: 818.736<br>VCE: 1.361"}
-        ],
-        'IC_19V_VCE_19V': [
-            {'x': 1.138, 'y': 449.998, 'text': "450A<br>IC: 449.998<br>VCE: 1.138"},
-            {'x': 1.344, 'y': 811.420, 'text': "820A<br>IC: 811.420<br>VCE: 1.344"}
-        ]
-    }
-
-    # 定義顏色對應
-    color_mapping = {
-        'IC_9V_VCE_9V': '#D3D3D3',
-        'IC_11V_VCE_11V': '#8FBC8F',
-        'IC_13V_VCE_13V': '#FF8C00',
-        'IC_15V_VCE_15V': '#00CED1',
-        'IC_17V_VCE_17V': '#9370DB',
-        'IC_19V_VCE_19V': 'navy'
-    }
-
-    # 初始化圖表
-    fig = go.Figure()
-
-    # 繪製曲線
-    for temp_key, data in temperature_data.items():
-        if selected_temp_graph == 'all_voltages' or temp_key == selected_temp_graph:
-            # 設置圖表模式
-            if selected_temp_graph == 'all_voltages':
-                mode = 'lines'  # 不顯示標記點
+        # 檢查競爭對手 PDF 文件
+        missing_competitor_pdfs = []
+        for label, path in competitor_pdfs.items():
+            if path.startswith("http://") or path.startswith("https://"):
+                try:
+                    response = requests.head(path, allow_redirects=True, timeout=5)
+                    if response.status_code != 200:
+                        logging.error(f"競爭對手 PDF 文件缺失: {path} (HTTP status code: {response.status_code})")
+                        missing_competitor_pdfs.append(path)
+                except Exception as e:
+                    logging.error(f"競爭對手 PDF 文件檢查失敗: {path} ({e})")
+                    missing_competitor_pdfs.append(path)
             else:
-                mode = 'lines+markers'  # 顯示標記點
+                file_path = os.path.join(os.getcwd(), path)
+                if not os.path.exists(file_path):
+                    logging.error(f"競爭對手 PDF 文件缺失: {file_path}")
+                    missing_competitor_pdfs.append(file_path)
 
-            fig.add_trace(go.Scatter(
-                x=data['VCE'],
-                y=data['IC'],
-                mode=mode,
-                name=data['Temperature'][0],
-                line=dict(color=color_mapping.get(temp_key, 'blue'), width=2),
-                marker=dict(size=4)  # 設置標記點大小為4
-            ))
-
-            # **新增：僅在非「所有電壓」時添加標註**
-            if selected_temp_graph != 'all_voltages':
-                for point in target_currents.get(temp_key, []):
-                    fig.add_annotation(
-                        x=point['x'], y=point['y'],
-                        text=point['text'],
-                        showarrow=True,
-                        arrowhead=2,
-                        ax=0,  # 箭頭的x坐標
-                        ay=-30,  # 箭頭的y坐標，距離標籤
-                        font=dict(size=12, color='black'),  # 將字體顏色設為黑色
-                        bgcolor='rgba(255, 255, 255, 0.7)',  # 半透明背景
-                        bordercolor='rgba(255, 255, 255, 0)',  # 無邊框顏色
-                        borderwidth=1,
-                        borderpad=4
-                    )
-
-    # 設置圖表布局
-    if selected_temp_graph != 'all_voltages':
-        title = f"IC vs VCE for {selected_temp_graph.replace('_', ' ')}"
-    else:
-        title = "IC vs VCE"  # 移除「所有電壓」的標籤
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="VCE (V)",
-        yaxis_title="IC (A)",
-        margin=dict(l=40, r=40, t=60, b=40),  # 增加邊距
-        paper_bgcolor='white',  # 設置背景顏色為白色
-        plot_bgcolor='white',  # 設置圖表區域背景為白色
-        font=dict(
-            family="Arial, sans-serif",
-            size=14,
-            color="black"
-        ),
-        titlefont=dict(size=20, color='black'),  # 主標題字體大小和顏色
-        xaxis=dict(
-            showgrid=True,  # 顯示網格線
-            gridcolor='lightgrey',  # 網格線顏色
-            tickmode='linear',
-            dtick=0.8,  # 設置刻度間隔
-            range=[-1, 4],  # 調整範圍為-1到4V以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
-        ),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor='lightgrey',
-            tickmode='linear',
-            dtick=400,
-            tick0=-100,  # 設置起始刻度為 -100
-            range=[-100, 1700],  # 調整範圍以匹配滑桿
-            zeroline=True,
-            zerolinecolor='black',
-            zerolinewidth=2,
-            showticklabels=True,
-        ),
-        legend=dict(
-            x=1,
-            y=0.99,
-            bgcolor='rgba(255,255,255,0)',
-            bordercolor='rgba(0,0,0,0)'
-        )
-    )
-
-    # 準備表格數據
-    table_data = []
-    if selected_temp_table == 'all_voltages':
-        for temp_key, data in temperature_data.items():
-            # 過濾掉 IC 或 VCE 為 NaN 的行
-            valid_data = [
-                {'編號': idx + 1 + len(table_data), 'Voltage (V)': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                for idx, (temp, ic, vce) in enumerate(zip(data['Temperature'], data['IC'], data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
-            table_data.extend(valid_data)
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-            # 過濾掉 IC 或 VCE 為 NaN 的行
-            table_data = [
-                {'編號': idx + 1, 'Voltage (V)': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                for idx, (temp, ic, vce) in enumerate(zip(temp_data['Temperature'], temp_data['IC'], temp_data['VCE']))
-                if not (pd.isna(ic) or pd.isna(vce))
-            ]
+        if missing_competitor_pdfs:
+            raise FileNotFoundError(f"以下競爭對手 PDF 文件缺失: {missing_competitor_pdfs}")
         else:
-            temp_data = {'IC': [], 'VCE': [], 'Temperature': []}
-            table_data = []
+            logging.info("所有競爭對手 PDF 文件均存在。")
 
-    # 定義表格欄位
-    columns = [
-        {"name": "Index", "id": "編號", "type": "numeric"},
-        {"name": "Voltage (V)", "id": "Voltage (V)", "type": "text"},
-        {"name": "IC (A)", "id": "IC (A)", "type": "numeric"},
-        {"name": "VCE (V)", "id": "VCE (V)", "type": "numeric"}
-    ]
+        # 運行應用
+        # 假設 app 是已建立的 Dash 應用
+        app.run_server(debug=True)
 
-    if selected_temp_table == 'all_voltages':
-        # Concatenate all voltages' data
-        table_data = []
+        app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP, '/assets/styles.css'],
+                        suppress_callback_exceptions=True)
+        server = app.server  # 如果需要部署到伺服器
 
-        for temp_key, data in temperature_data.items():
-            ic_values = [f"{ic:.3f}" for ic in data['IC']]
-            vce_values = [f"{vce:.4f}" for vce in data['VCE']]
-            temp_values = data['Temperature']
-            table_data.extend([{'編號': idx + 1 + len(table_data), 'Voltage (V)': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                               for idx, (temp, ic, vce) in enumerate(zip(temp_values, ic_values, vce_values))])
-
-    else:
-        if selected_temp_table in temperature_data:
-            temp_data = temperature_data[selected_temp_table]
-        else:
-            temp_data = {'IC': [], 'VCE': [], 'Temperature': []}
-
-        ic_values = [f"{ic:.3f}" for ic in temp_data['IC']]  # 保留IC數值小數點後三位
-        vce_values = [f"{vce:.4f}" for vce in temp_data['VCE']]  # 保留VCE數值小數點後四位
-        temp_values = temp_data['Temperature']
-
-        # 構建表格數據
-        table_data = [{'編號': idx + 1, 'Voltage (V)': temp, 'IC (A)': ic, 'VCE (V)': vce}
-                      for idx, (temp, ic, vce) in enumerate(zip(temp_values, ic_values, vce_values))]
-
-    # 定義表格欄位（保持不變）
-    columns = [
-        {"name": "Index", "id": "編號"},
-        {"name": "Voltage (V)", "id": "Voltage (V)"},
-        {"name": "IC (A)", "id": "IC (A)"},
-        {"name": "VCE (V)", "id": "VCE (V)"}
-    ]
-
-    return fig, table_data, columns
-
-# 回調函數：處理四個頁籤的存檔功能
-# 已移除 download-tab1、download-tab2 和 download-tab1-2 的相關回調函數
-
-
-# 更新顯示的IC範圍輸出
-@app.callback(
-    Output('loss_ic-output4', 'children'),
-    Input('loss_ic-range-slider4', 'value')
-)
-def update_loss_ic_output4(ic_range):
-    print(f"IC Range Updated: {ic_range}")  # 調試輸出
-    return f"目前 IC 範圍: {ic_range[0]} A 至 {ic_range[1]} A"
-
-# 更新顯示的VCE範圍輸出
-@app.callback(
-    Output('loss_vce-output4', 'children'),
-    Input('loss_vce-range-slider4', 'value')
-)
-def update_loss_vce_output4(vce_range):
-    print(f"VCE Range Updated: {vce_range}")  # 調試輸出
-    return f"目前 VCE 範圍: {vce_range[0]} V 至 {vce_range[1]} V"
-
-
-# 更新顯示的IC範圍輸出
-@app.callback(
-    Output('loss_ic-output3', 'children'),
-    Input('loss_ic-range-slider3', 'value')
-)
-def update_loss_ic_output3(ic_range):
-    print(f"IC Range Updated: {ic_range}")  # 調試輸出
-    return f"目前 IC 範圍: {ic_range[0]} A 至 {ic_range[1]} A"
-
-# 更新顯示的VCE範圍輸出
-@app.callback(
-    Output('loss_vce-output3', 'children'),
-    Input('loss_vce-range-slider3', 'value')
-)
-def update_loss_vce_output3(vce_range):
-    print(f"VCE Range Updated: {vce_range}")  # 調試輸出
-    return f"目前 VCE 範圍: {vce_range[0]} V 至 {vce_range[1]} V"
-
-# 更新顯示的IC範圍輸出
-@app.callback(
-    Output('loss_ic-output', 'children'),
-    Input('loss_ic-range-slider', 'value')
-)
-def update_loss_ic_output(ic_range):
-    print(f"IC Range Updated: {ic_range}")  # 調試輸出
-    return f"目前 IC 範圍: {ic_range[0]} A 至 {ic_range[1]} A"
-
-# 更新顯示的VCE範圍輸出
-@app.callback(
-    Output('loss_vce-output', 'children'),
-    Input('loss_vce-range-slider', 'value')
-)
-def update_loss_vce_output(vce_range):
-    print(f"VCE Range Updated: {vce_range}")  # 調試輸出
-    return f"目前 VCE 範圍: {vce_range[0]} V 至 {vce_range[1]} V"
-
-# 更新顯示的IC範圍輸出
-@app.callback(
-    Output('loss_ic-output2', 'children'),
-    Input('loss_ic-range-slider2', 'value')
-)
-def update_loss_ic_output2(ic_range):
-    print(f"IC Range Updated: {ic_range}")  # 調試輸出
-    return f"目前 IC 範圍: {ic_range[0]} A 至 {ic_range[1]} A"
-
-@app.callback(
-    Output('loss_vce-output2', 'children'),
-    Input('loss_vce-range-slider2', 'value')
-)
-def update_loss_vce_output2(vce_range):
-    print(f"VCE Range Updated: {vce_range}")  # 調試輸出
-    return f"目前 VCE 範圍: {vce_range[0]} V 至 {vce_range[1]} V"
-
-
-
-@app.callback(
-    [Output('eoneoffic-image4', 'src'),
-     Output('eoneoffic-title4', 'children')],
-    Input('eoneoffic-radio4', 'value')
-)
-def update_icvce_image4(selected_radio):
-    print(f"Selected Radio Option4: {selected_radio}")  # 調試輸出
-    # 根據選擇的值返回相應的圖片路徑和標題
-    image_mapping = {
-        'EONEOFFIC': ('EONEOFFICE.png', 'VGE = -8V / + 15V,RG,on = 2.5 Ω,RG,off = 5.0 Ω, VCE = 400V')
-    }
-
-    image_filename, title = image_mapping.get(selected_radio, ('EONEOFFICE.png', 'VGE = 15V, IC = f(VCE)'))
-
-    # 生成圖片完整路徑
-    image_src = f'/assets/{image_filename}'
-
-    print(f"Image Source4: {image_src}, Title4: {title}")  # 調試輸出
-
-    return image_src, title
-
-
-
-@app.callback(
-    [Output('icvce-image3', 'src'),
-     Output('icvce-title3', 'children')],
-    Input('icvce-radio3', 'value')
-)
-def update_icvce_image3(selected_radio):
-    print(f"Selected Radio Option3: {selected_radio}")  # 調試輸出
-    # 根據選擇的值返回相應的圖片路徑和標題
-    image_mapping = {
-        'VGE_15V_IC_f_VCE': ('IFVFD.png', 'If = f(VF)')
-    }
-
-    image_filename, title = image_mapping.get(selected_radio, ('IFVFD.png', 'VGE = 15V, IC = f(VCE)'))
-
-    # 生成圖片完整路徑
-    image_src = f'/assets/{image_filename}'
-
-    print(f"Image Source1: {image_src}, Title3: {title}")  # 調試輸出
-
-    return image_src, title
-
-
-# 回調函數：根據 Characteristics Diagrams 的 RadioItems 選擇更新圖片和標題
-@app.callback(
-    [Output('icvce-image1', 'src'),
-     Output('icvce-title1', 'children')],
-    Input('icvce-radio1', 'value')
-)
-def update_icvce_image1(selected_radio):
-    print(f"Selected Radio Option1: {selected_radio}")  # 調試輸出
-    # 根據選擇的值返回相應的圖片路徑和標題
-    image_mapping = {
-        'VGE_15V_IC_f_VCE': ('ICVCE15V.png', 'VGE = 15V, IC = f(VCE)')
-    }
-
-    image_filename, title = image_mapping.get(selected_radio, ('ICVCE15V.png', 'VGE = 15V, IC = f(VCE)'))
-
-    # 生成圖片完整路徑
-    image_src = f'/assets/{image_filename}'
-
-    print(f"Image Source1: {image_src}, Title1: {title}")  # 調試輸出
-
-    return image_src, title
-
-# 回調函數：根據 Characteristics Diagrams2 的 RadioItems 選擇更新圖片和標題
-@app.callback(
-    [Output('icvce-image2', 'src'),
-     Output('icvce-title2', 'children')],
-    Input('icvce-radio2', 'value')
-)
-def update_icvce_image2(selected_radio):
-    print(f"Selected Radio Option2: {selected_radio}")  # 調試輸出
-    # 根據選擇的值返回相應的圖片路徑和標題
-    image_mapping = {
-        'Tj_25C_IC_f_VCE': ('ICVCE25.png', 'Tj = 25℃, IC = f(VCE)'),
-        'Tj_150C_IC_f_VCE': ('ICVCE150.png', 'Tj = 150℃, IC = f(VCE)')
-    }
-
-    image_filename, title = image_mapping.get(selected_radio, ('ICVCE25.png', 'Tj = 25℃, IC = f(VCE)'))
-
-    # 生成圖片完整路徑
-    image_src = f'/assets/{image_filename}'
-
-    print(f"Image Source2: {image_src}, Title2: {title}")  # 調試輸出
-
-    return image_src, title
-
-# 啟動應用程式
-if __name__ == '__main__':
-    app.run_server(debug=True)
-
+    except FileNotFoundError as e:
+        logging.error(e)
+        print(e)
