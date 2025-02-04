@@ -79,7 +79,7 @@ latest_datasheet = df.sort_values(by='TimeStamp', ascending=False).head(1)
 latest_four = df.sort_values(by='TimeStamp', ascending=False).head(4)[['Type Name', 'TimeStamp', 'Version']]
 
 # 讀取 Datasheetdatalist.csv 並處理
-datasheet_csv_path = '/Users/helen/PycharmProjects/Simulation_Tools/data/Datasheetdatalist.csv'
+datasheet_csv_path = 'https://raw.githubusercontent.com/HelenWei1128/Datasheetdb/main/Datasheetdatalist.csv'
 
 
 
